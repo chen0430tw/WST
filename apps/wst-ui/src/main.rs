@@ -673,7 +673,16 @@ fn main() -> Result<()> {
     let _ = init_utf8_console();
 
     let config = WstConfig::load_default()?;
-    let fullscreen_enabled = config.fullscreen;
+
+    // Parse command-line args (overrides config)
+    let args: Vec<String> = std::env::args().collect();
+    let fullscreen_enabled = if args.iter().any(|a| a == "-F" || a == "--fullscreen") {
+        true
+    } else if args.iter().any(|a| a == "--no-fullscreen") {
+        false
+    } else {
+        config.fullscreen
+    };
 
     // Enable F11 fullscreen BEFORE entering alternate screen
     // Windows Terminal's F11 works at window level, not terminal level
