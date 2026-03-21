@@ -7,6 +7,49 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+
+// Send F11 for Windows Terminal fullscreen (must be called BEFORE alternate screen)
+#[cfg(windows)]
+fn set_windows_terminal_fullscreen(fullscreen: bool) {
+    use windows::Win32::System::Console::GetConsoleWindow;
+    use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+    use winput::Vk;
+    use std::thread;
+    use std::time::Duration;
+
+    unsafe {
+        let hwnd = GetConsoleWindow();
+
+        // Bring window to foreground first
+        if !hwnd.is_invalid() {
+            let _ = SetForegroundWindow(hwnd);
+            thread::sleep(Duration::from_millis(150));
+        }
+
+        // Send F11 to toggle Windows Terminal fullscreen
+        let _ = winput::send(Vk::F11);
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+// Send Alt+Enter for legacy console fullscreen (must be called AFTER alternate screen)
+#[cfg(windows)]
+fn set_legacy_console_fullscreen() {
+    use winput::{Vk, Action, Input};
+    use std::thread;
+    use std::time::Duration;
+
+    // Send Alt+Enter for legacy console fullscreen
+    thread::sleep(Duration::from_millis(100));
+
+    let inputs = [
+        Input::from_vk(Vk::LeftMenu, Action::Press),   // Alt down
+        Input::from_vk(Vk::Enter, Action::Press),      // Enter down
+        Input::from_vk(Vk::Enter, Action::Release),    // Enter up
+        Input::from_vk(Vk::LeftMenu, Action::Release), // Alt up
+    ];
+    let _ = winput::send_inputs(&inputs);
+}
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -111,6 +154,26 @@ impl AppState {
     fn handle_input(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => self.execute_command(),
+            // Ctrl+P/N for command history (must come before generic Char)
+            KeyCode::Char('p') | KeyCode::Char('P') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Ok(mut core) = self.core.try_lock() {
+                    if let Some(cmd) = core.history_prev() {
+                        self.input = cmd;
+                        self.cursor_position = self.input.len();
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Ok(mut core) = self.core.try_lock() {
+                    if let Some(cmd) = core.history_next() {
+                        self.input = cmd;
+                        self.cursor_position = self.input.len();
+                    } else {
+                        self.input.clear();
+                        self.cursor_position = 0;
+                    }
+                }
+            }
             KeyCode::Char(c) => {
                 if !c.is_control() {
                     self.input.insert(self.cursor_position, c);
@@ -135,26 +198,6 @@ impl AppState {
             // Up/Down now scroll output (WT converts mouse wheel to these keys)
             KeyCode::Up => self.scroll_output_up(3),
             KeyCode::Down => self.scroll_output_down(3),
-            // Ctrl+P/N for command history
-            KeyCode::Char('p') | KeyCode::Char('P') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Ok(mut core) = self.core.try_lock() {
-                    if let Some(cmd) = core.history_prev() {
-                        self.input = cmd;
-                        self.cursor_position = self.input.len();
-                    }
-                }
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Ok(mut core) = self.core.try_lock() {
-                    if let Some(cmd) = core.history_next() {
-                        self.input = cmd;
-                        self.cursor_position = self.input.len();
-                    } else {
-                        self.input.clear();
-                        self.cursor_position = 0;
-                    }
-                }
-            }
             KeyCode::Esc => {
                 self.input.clear();
                 self.cursor_position = 0;
@@ -630,10 +673,25 @@ fn main() -> Result<()> {
     let _ = init_utf8_console();
 
     let config = WstConfig::load_default()?;
+    let fullscreen_enabled = config.fullscreen;
+
+    // Enable F11 fullscreen BEFORE entering alternate screen
+    // Windows Terminal's F11 works at window level, not terminal level
+    #[cfg(windows)]
+    if fullscreen_enabled {
+        set_windows_terminal_fullscreen(true);
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+
+    // Try Alt+Enter for legacy console fullscreen (after alternate screen)
+    #[cfg(windows)]
+    if fullscreen_enabled {
+        set_legacy_console_fullscreen();
+    }
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -641,6 +699,13 @@ fn main() -> Result<()> {
     let result = run_app(&mut terminal, state);
 
     disable_raw_mode()?;
+
+    // Disable F11 fullscreen after leaving alternate screen
+    #[cfg(windows)]
+    if fullscreen_enabled {
+        set_windows_terminal_fullscreen(false);
+    }
+
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
     result?;
