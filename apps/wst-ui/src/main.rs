@@ -27,6 +27,13 @@ fn set_console_fullscreen() {
     ];
     let _ = winput::send_inputs(&inputs);
 }
+
+// Detect if running in Windows Terminal
+// Windows Terminal sets WT_SESSION environment variable
+#[cfg(windows)]
+fn is_windows_terminal() -> bool {
+    std::env::var("WT_SESSION").is_ok()
+}
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -656,10 +663,13 @@ fn main() -> Result<()> {
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
 
-    // Try Alt+Enter for fullscreen (after alternate screen is active)
+    // Try Alt+Enter for fullscreen only in legacy console (not Windows Terminal)
     #[cfg(windows)]
     if fullscreen_enabled {
-        set_console_fullscreen();
+        // Only auto-fullscreen in legacy console, not Windows Terminal
+        if !is_windows_terminal() {
+            set_console_fullscreen();
+        }
     }
 
     let backend = CrosstermBackend::new(stdout);
