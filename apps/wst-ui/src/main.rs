@@ -1,29 +1,33 @@
 mod builtin;
 
 use anyhow::Result;
+use unicode_width::UnicodeWidthChar;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, KeyEventKind, MouseEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    cursor::SetCursorStyle,
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::Paragraph,
     Frame, Terminal,
 };
-use std::io::{self, Write};
+use std::io;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use wst_config::WstConfig;
 use wst_core::WstCore;
 use wst_protocol::{BackendKind, SessionEvent, TaskStatus};
 
 const INPUT_PROMPT: &str = ">";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const CP_UTF8: u32 = 65001;
 
+#[derive(Clone)]
 struct OutputLine {
     text: String,
     is_error: bool,
@@ -57,38 +61,57 @@ impl OutputLine {
 }
 
 struct AppState {
-    core: WstCore,
+    core: Arc<tokio::sync::Mutex<WstCore>>,
     input: String,
     cursor_position: usize,
     output: Vec<OutputLine>,
     running: bool,
     session_id: Option<u64>,
     scroll_offset: usize,
-    cursor_visible: bool,
+    current_task_id: Option<u64>,
+    command_in_progress: bool,
+    current_dir: String,
+    debug_mode: bool,
+    // Debug stats
+    lines_received: usize,
+    last_command: String,
+    backend_encoding: String,
 }
 
 impl AppState {
-    fn new(config: WstConfig) -> Result<Self> {
-        let core = WstCore::new(config);
-        Ok(Self {
+    fn new(config: WstConfig) -> Self {
+        let core = Arc::new(tokio::sync::Mutex::new(WstCore::new(config)));
+        let current_dir = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("C:\\Users\\Administrator"))
+            .to_string_lossy()
+            .to_string();
+
+        Self {
             core,
             input: String::new(),
             cursor_position: 0,
-            output: vec![],
+            output: vec![
+                OutputLine::system(format!("WST v{} - Windows Subsystem for TTY", VERSION)),
+                OutputLine::normal("Type :help for available commands"),
+                OutputLine::normal(""),
+            ],
             running: true,
             session_id: None,
             scroll_offset: 0,
-            cursor_visible: true,
-        })
+            current_task_id: None,
+            command_in_progress: false,
+            current_dir,
+            debug_mode: false,
+            lines_received: 0,
+            last_command: String::new(),
+            backend_encoding: "UTF-8".to_string(),
+        }
     }
 
     fn handle_input(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter => {
-                self.execute_command();
-            }
+            KeyCode::Enter => self.execute_command(),
             KeyCode::Char(c) => {
-                // Filter out control characters
                 if !c.is_control() {
                     self.input.insert(self.cursor_position, c);
                     self.move_cursor_right();
@@ -107,34 +130,64 @@ impl AppState {
             }
             KeyCode::Left => self.move_cursor_left(),
             KeyCode::Right => self.move_cursor_right(),
-            KeyCode::Home => {
-                self.cursor_position = 0;
-            }
-            KeyCode::End => {
-                self.cursor_position = self.input.len();
-            }
+            KeyCode::Home => self.cursor_position = 0,
+            KeyCode::End => self.cursor_position = self.input.len(),
             KeyCode::Up => {
-                if let Some(cmd) = self.core.history_mut().prev() {
-                    self.input = cmd.to_string();
-                    self.cursor_position = self.input.len();
+                if let Ok(mut core) = self.core.try_lock() {
+                    if let Some(cmd) = core.history_prev() {
+                        self.input = cmd;
+                        self.cursor_position = self.input.len();
+                    }
                 }
             }
             KeyCode::Down => {
-                if let Some(cmd) = self.core.history_mut().next() {
-                    self.input = cmd.to_string();
-                    self.cursor_position = self.input.len();
-                } else {
-                    self.input.clear();
-                    self.cursor_position = 0;
+                if let Ok(mut core) = self.core.try_lock() {
+                    if let Some(cmd) = core.history_next() {
+                        self.input = cmd;
+                        self.cursor_position = self.input.len();
+                    } else {
+                        self.input.clear();
+                        self.cursor_position = 0;
+                    }
                 }
             }
             KeyCode::Esc => {
                 self.input.clear();
                 self.cursor_position = 0;
-                self.core.history_mut().reset();
+                if let Ok(mut core) = self.core.try_lock() {
+                    core.history_reset();
+                }
             }
+            KeyCode::PageUp => self.scroll_output_up(5),
+            KeyCode::PageDown => self.scroll_output_down(5),
             _ => {}
         }
+    }
+
+    fn handle_mouse(&mut self, event: MouseEvent) {
+        // Handle mouse wheel scroll
+        use crossterm::event::MouseEventKind;
+        match event.kind {
+            MouseEventKind::ScrollUp => self.scroll_output_up(3),
+            MouseEventKind::ScrollDown => self.scroll_output_down(3),
+            _ => {
+                // Ignore other mouse events to allow text selection
+            }
+        }
+    }
+
+    fn scroll_output_up(&mut self, amount: usize) {
+        // Scroll up means showing older content (increase offset from bottom)
+        let max_offset = self.output.len().saturating_sub(1);
+        self.scroll_offset = self.scroll_offset.saturating_add(amount);
+        if self.scroll_offset > max_offset {
+            self.scroll_offset = max_offset;
+        }
+    }
+
+    fn scroll_output_down(&mut self, amount: usize) {
+        // Scroll down means showing newer content (decrease offset toward bottom)
+        self.scroll_offset = self.scroll_offset.saturating_sub(amount);
     }
 
     fn move_cursor_left(&mut self) {
@@ -149,35 +202,49 @@ impl AppState {
 
     fn execute_command(&mut self) {
         let command = self.input.trim().to_string();
-
         if command.is_empty() {
             self.input.clear();
             self.cursor_position = 0;
             return;
         }
 
-        // Add command to output
-        self.output.push(OutputLine::normal(format!("{} {}", INPUT_PROMPT, command)));
+        // Alias cls/clear to :clear
+        if command.eq_ignore_ascii_case("cls") || command.eq_ignore_ascii_case("clear") {
+            self.output.clear();
+            self.scroll_offset = 0;
+            self.input.clear();
+            self.cursor_position = 0;
+            return;
+        }
+
+        self.output.push(OutputLine::normal(format!("{}> {}", self.current_dir, command)));
+        self.scroll_to_bottom();
+
+        // Track command and reset stats
+        self.last_command = command.clone();
+        self.lines_received = 0;
 
         if command.starts_with(':') {
             self.handle_builtin(&command);
         } else {
-            match self.ensure_session() {
-                Ok(session) => match self.core.exec_with_session(session, command) {
-                    Ok(_task_id) => {}
+            if let Ok(mut core) = self.core.try_lock() {
+                // Reset session if backend was switched
+                if let Ok(sid) = core.ensure_session() {
+                    self.session_id = Some(sid);
+                }
+                match core.exec(command.clone()) {
+                    Ok(_tid) => {
+                        self.current_task_id = Some(_tid);
+                    }
                     Err(e) => {
                         self.output.push(OutputLine::error(format!("Error: {}", e)));
                     }
-                },
-                Err(e) => {
-                    self.output.push(OutputLine::error(format!("Session error: {}", e)));
                 }
             }
         }
 
         self.input.clear();
         self.cursor_position = 0;
-        self.scroll_to_bottom();
     }
 
     fn handle_builtin(&mut self, command: &str) {
@@ -191,36 +258,48 @@ impl AppState {
                 self.output.push(OutputLine::normal("  :status      - Show current status"));
                 self.output.push(OutputLine::normal("  :clear       - Clear output"));
                 self.output.push(OutputLine::normal("  :history     - Show command history"));
-                self.output
-                    .push(OutputLine::normal("  :backend     - Switch backend (Cygctl|Pwsh|Cmd)"));
+                self.output.push(OutputLine::normal("  :backend     - Switch backend (Cygctl|Pwsh|Cmd)"));
+                self.output.push(OutputLine::normal("  :debug       - Toggle debug mode"));
                 self.output.push(OutputLine::normal("  :exit / :q   - Exit WST"));
             }
             ":status" => {
-                self.output.push(OutputLine::system(format!("WST v{} - Windows Subsystem for TTY", VERSION)));
-                self.output.push(OutputLine::normal(format!("Backend: {:?}", self.core.default_backend())));
-                self.output
-                    .push(OutputLine::normal(format!("Session: {:?}", self.session_id)));
-                self.output
-                    .push(OutputLine::normal(format!("History: {} commands", self.core.history().len())));
+                if let Ok(core) = self.core.try_lock() {
+                    self.output.push(OutputLine::system(format!(
+                        "WST v{} - Windows Subsystem for TTY",
+                        VERSION
+                    )));
+                    self.output
+                        .push(OutputLine::normal(format!("Backend: {:?}", core.default_backend())));
+                    self.output
+                        .push(OutputLine::normal(format!("Session: {:?}", self.session_id)));
+                    self.output.push(OutputLine::normal(format!(
+                        "History: {} commands",
+                        core.history().len()
+                    )));
+                }
             }
             ":clear" => {
                 self.output.clear();
                 self.scroll_offset = 0;
             }
             ":history" => {
-                for (i, entry) in self.core.history().iter().enumerate() {
-                    self.output
-                        .push(OutputLine::normal(format!("  {}: {}", i + 1, entry.command)));
+                if let Ok(core) = self.core.try_lock() {
+                    for (i, entry) in core.history().iter().enumerate() {
+                        self.output
+                            .push(OutputLine::normal(format!("  {}: {}", i + 1, entry.command)));
+                    }
                 }
             }
             ":backend" => {
                 if parts.len() < 2 {
-                    self.output.push(OutputLine::normal(format!(
-                        "Current backend: {:?}",
-                        self.core.default_backend()
-                    )));
-                    self.output
-                        .push(OutputLine::normal("Usage: :backend <Cygctl|Pwsh|Cmd>"));
+                    if let Ok(core) = self.core.try_lock() {
+                        self.output.push(OutputLine::normal(format!(
+                            "Current backend: {:?}",
+                            core.default_backend()
+                        )));
+                        self.output
+                            .push(OutputLine::normal("Usage: :backend <Cygctl|Pwsh|Cmd>"));
+                    }
                 } else {
                     let new_backend = match parts[1].to_lowercase().as_str() {
                         "cygctl" => Some(BackendKind::Cygctl),
@@ -230,16 +309,26 @@ impl AppState {
                     };
 
                     if let Some(kind) = new_backend {
-                        match self.core.switch_backend(kind) {
-                            Ok(()) => {
-                                self.output.push(OutputLine::system(format!(
-                                    "Switched to {:?} backend",
-                                    kind
-                                )));
-                                self.session_id = None;
-                            }
-                            Err(e) => {
-                                self.output.push(OutputLine::error(format!("Failed to switch: {}", e)));
+                        if let Ok(mut core) = self.core.try_lock() {
+                            match core.switch_backend(kind) {
+                                Ok(()) => {
+                                    self.output.push(OutputLine::system(format!(
+                                        "Switched to {:?} backend",
+                                        kind
+                                    )));
+                                    self.session_id = None;
+                                    self.current_task_id = None;
+                                    self.command_in_progress = false;
+                                    // Update encoding info for debug
+                                    match kind {
+                                        BackendKind::Pwsh => self.backend_encoding = "Big5/UTF-16".to_string(),
+                                        BackendKind::Cmd => self.backend_encoding = "CP936/GBK".to_string(),
+                                        BackendKind::Cygctl => self.backend_encoding = "UTF-8".to_string(),
+                                    }
+                                }
+                                Err(e) => {
+                                    self.output.push(OutputLine::error(format!("Failed to switch: {}", e)));
+                                }
                             }
                         }
                     } else {
@@ -248,9 +337,14 @@ impl AppState {
                     }
                 }
             }
-            ":exit" | ":q" => {
-                self.running = false;
+            ":debug" => {
+                self.debug_mode = !self.debug_mode;
+                self.output.push(OutputLine::system(format!(
+                    "Debug mode: {}",
+                    if self.debug_mode { "ON" } else { "OFF" }
+                )));
             }
+            ":exit" | ":q" => self.running = false,
             _ => {
                 self.output.push(OutputLine::error(format!("Unknown builtin: {}", cmd)));
                 self.output.push(OutputLine::normal("Type :help for available commands"));
@@ -258,61 +352,85 @@ impl AppState {
         }
     }
 
-    fn ensure_session(&mut self) -> Result<u64> {
-        if let Some(id) = self.session_id {
-            Ok(id)
-        } else {
-            let id = self.core.create_session()?;
-            self.session_id = Some(id);
-            Ok(id)
-        }
-    }
-
-    fn tick(&mut self) {
-        if let Some(session) = self.session_id {
-            if let Ok(events) = self.core.tick_session(session) {
-                for event in events {
-                    match event {
-                        SessionEvent::SessionStarted(_id) => {}
-                        SessionEvent::Output(chunk) => {
-                            if chunk.is_stderr {
-                                self.output.push(OutputLine::error(chunk.text));
-                            } else {
-                                self.output.push(OutputLine::normal(chunk.text));
-                            }
-                        }
-                        SessionEvent::TaskUpdated { task_id: _, status } => {
-                            if let TaskStatus::Exited(code) = status {
-                                if code != 0 {
-                                    self.output.push(OutputLine::system(format!(
-                                        "Process exited with code {}",
-                                        code
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = self.output.len().saturating_sub(1);
-        if self.scroll_offset > 0 {
-            self.scroll_offset = self.output.len().saturating_sub(10);
-        }
+        self.scroll_offset = 0;
+    }
+
+    fn add_output(&mut self, line: OutputLine) {
+        self.output.push(line);
     }
 }
 
 fn draw_ui(f: &mut Frame, state: &mut AppState) {
     let size = f.size();
 
-    // Build terminal content
-    let mut terminal_lines: Vec<Line> = Vec::new();
+    // Layout: status bar (top) | main content (output + input)
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Status bar at top
+            Constraint::Min(1),    // Main content
+        ])
+        .split(size);
 
-    // Add output lines
-    for line in state.output.iter().skip(state.scroll_offset) {
+    // Draw status bar at top
+    let backend_name = if let Ok(core) = state.core.try_lock() {
+        format!("{:?}", core.default_backend())
+    } else {
+        "Unknown".to_string()
+    };
+
+    let mut status_line = vec![
+        Span::styled(" WST v", Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(VERSION, Style::default().fg(Color::Black).bg(Color::Cyan)),
+        Span::styled(" | ", Style::default().fg(Color::Cyan).bg(Color::Black)),
+        Span::styled(
+            format!("{} ", backend_name),
+            Style::default().fg(Color::Green).bg(Color::Black),
+        ),
+    ];
+
+    // Show DEBUG indicator when debug mode is on
+    if state.debug_mode {
+        status_line.push(Span::styled(
+            "DEBUG ",
+            Style::default().fg(Color::Red).bg(Color::Black),
+        ));
+    }
+
+    status_line.push(Span::styled(
+        format!("Sess:{:?} Hist:{} ",
+            state.session_id,
+            if let Ok(core) = state.core.try_lock() { core.history().len() } else { 0 }
+        ),
+        Style::default().fg(Color::DarkGray).bg(Color::Black),
+    ));
+
+    let status_paragraph = Paragraph::new(Line::from(status_line))
+        .style(Style::default().bg(Color::Rgb(20, 20, 30)));
+    f.render_widget(status_paragraph, chunks[0]);
+
+    // Draw output + input in main area
+    let area = chunks[1];
+    let buf = f.buffer_mut();
+
+    // Calculate which output lines to show
+    let output_len = state.output.len();
+    let max_output_y = area.y + area.height - 1; // Bottom of area
+    let visible_count = (max_output_y - area.y + 1) as usize;
+    let (start, count) = if output_len <= visible_count {
+        (0, output_len)
+    } else {
+        let offset = state.scroll_offset.min(output_len - visible_count);
+        (output_len - visible_count - offset, visible_count)
+    };
+
+    // Render output lines from top
+    let mut y = area.y;
+    for line in state.output.iter().skip(start).take(count) {
+        if y > max_output_y {
+            break;
+        }
         let style = if line.is_error {
             Style::default().fg(Color::Red)
         } else if line.is_system {
@@ -320,70 +438,201 @@ fn draw_ui(f: &mut Frame, state: &mut AppState) {
         } else {
             Style::default().fg(Color::Reset)
         };
-        terminal_lines.push(Line::from(vec![Span::styled(&line.text, style)]));
+        let text = line.text.replace('\t', "        ");
+        let mut col = area.x;
+        for ch in text.chars() {
+            if col < area.x + area.width {
+                buf.get_mut(col, y).set_char(ch).set_style(style.clone());
+                col += ch.width().unwrap_or(1) as u16;
+            }
+        }
+        y += 1;
     }
 
-    // Build input line with visible cursor
-    let before_cursor = &state.input[..state.cursor_position];
-    let after_cursor = if state.cursor_position < state.input.len() {
-        &state.input[state.cursor_position..]
+    // Calculate input line position (right after output, but not past bottom)
+    let input_y = if state.debug_mode {
+        (y + 2).min(area.y + area.height - 1) // +1 for debug line, +1 to move past it
+    } else {
+        (y + 1).min(area.y + area.height - 1)
+    };
+
+    // Add debug info before input if debug mode is on
+    if state.debug_mode {
+        let debug_y = input_y.saturating_sub(1);
+        if debug_y >= area.y {
+            let backend_name = if let Ok(core) = state.core.try_lock() {
+                format!("{:?}", core.default_backend())
+            } else {
+                "Unknown".to_string()
+            };
+            let debug_info = format!(
+                "[DEBUG] b:{} enc:{} l:{} s:{} t:{:?}",
+                backend_name,
+                state.backend_encoding,
+                state.lines_received,
+                state.scroll_offset,
+                state.current_task_id
+            );
+            let mut col = area.x;
+            for ch in debug_info.chars() {
+                if col < area.x + area.width {
+                    buf.get_mut(col, debug_y)
+                        .set_char(ch)
+                        .set_style(Style::default().fg(Color::Yellow));
+                    col += ch.width().unwrap_or(1) as u16;
+                }
+            }
+        }
+    }
+
+    // Input prompt at the last line
+    let cursor_pos = state.cursor_position.min(state.input.len());
+    let before_cursor = &state.input[..cursor_pos];
+    let after_cursor = if cursor_pos < state.input.len() {
+        &state.input[cursor_pos..]
     } else {
         ""
     };
 
-    let input_line = vec![
-        Span::styled(INPUT_PROMPT, Style::default().fg(Color::Green)),
-        Span::raw(" "),
-        Span::raw(before_cursor),
-        Span::styled("▌", Style::default().fg(Color::White)), // Visible cursor
-        Span::raw(after_cursor),
-    ];
-    terminal_lines.push(Line::from(input_line));
+    let prompt_text = format!("{}>", state.current_dir);
+    let input_line = format!("{}{}{}", prompt_text, before_cursor, after_cursor);
 
-    // Render
-    let terminal = Paragraph::new(terminal_lines)
-        .wrap(Wrap { trim: false })
-        .style(Style::default().bg(Color::Black).fg(Color::White));
-    f.render_widget(terminal, size);
+    // Write input line
+    let mut col = area.x;
+    for ch in input_line.chars() {
+        if col < area.x + area.width {
+            buf.get_mut(col, input_y)
+                .set_char(ch)
+                .set_style(Style::default().fg(Color::White));
+            col += ch.width().unwrap_or(1) as u16;
+        }
+    }
+
+    // Set cursor position
+    let prompt_width: u16 = prompt_text.chars().map(|c: char| c.width().unwrap_or(1) as u16).sum();
+    let before_cursor_width: u16 = before_cursor.chars().map(|c: char| c.width().unwrap_or(1) as u16).sum();
+    let cursor_x = prompt_width + before_cursor_width;
+    let _ = f.set_cursor(area.x + cursor_x, input_y);
+}
+
+enum AppEvent {
+    Backend(SessionEvent),
+}
+
+async fn run_event_loop(
+    core: Arc<tokio::sync::Mutex<WstCore>>,
+    tx: mpsc::UnboundedSender<AppEvent>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(50));
+    loop {
+        interval.tick().await;
+        let mut core_guard = core.lock().await;
+        if let Ok(events) = core_guard.tick() {
+            for event in events {
+                let _ = tx.send(AppEvent::Backend(event));
+            }
+        }
+    }
 }
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut state: AppState,
 ) -> Result<()> {
-    let mut last_tick = std::time::Instant::now();
-    let tick_rate = Duration::from_millis(100);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let core_clone = state.core.clone();
 
-    // Set cursor style to blinking block
-    execute!(terminal.backend_mut(), SetCursorStyle::BlinkingBlock)?;
+    // Don't enable mouse capture - allows text selection in Windows Terminal
+    // Wheel events still work without capture mode
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.spawn(run_event_loop(core_clone, tx));
+
+    let tick_rate = Duration::from_millis(100);
 
     while state.running {
         terminal.draw(|f| draw_ui(f, &mut state))?;
 
-        let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-        if crossterm::event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        state.running = false;
+        // Process ALL available backend events
+        loop {
+            match rx.try_recv() {
+                Ok(AppEvent::Backend(SessionEvent::Output(chunk))) => {
+                    state.lines_received += 1;
+                    if chunk.is_stderr {
+                        state.add_output(OutputLine::error(chunk.text));
+                    } else {
+                        state.add_output(OutputLine::normal(chunk.text));
                     }
-                    _ => {
-                        state.handle_input(key);
+                }
+                Ok(AppEvent::Backend(SessionEvent::TaskUpdated { task_id, status })) => {
+                    if let TaskStatus::Exited(code) = status {
+                        if state.current_task_id == Some(task_id) {
+                            state.command_in_progress = false;
+                            if code != 0 {
+                                state.add_output(OutputLine::system(format!(
+                                    "Process exited with code {}",
+                                    code
+                                )));
+                            }
+                        }
                     }
+                }
+                Ok(AppEvent::Backend(SessionEvent::SessionStarted(id))) => {
+                    state.session_id = Some(id);
+                    state.add_output(OutputLine::system(format!("Session {} started", id)));
+                }
+                Ok(AppEvent::Backend(SessionEvent::Debug { message })) => {
+                    if state.debug_mode {
+                        state.add_output(OutputLine::system(format!("[DEBUG] {}", message)));
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    break; // No more events, exit loop
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    break;
                 }
             }
         }
 
-        if last_tick.elapsed() >= tick_rate {
-            state.tick();
-            last_tick = std::time::Instant::now();
+        if crossterm::event::poll(tick_rate)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    // Fix duplicate key events on Windows - only handle Press events
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.running = false;
+                        }
+                        _ => state.handle_input(key),
+                    }
+                }
+                Event::Mouse(mouse) => state.handle_mouse(mouse),
+                _ => {}
+            }
         }
     }
 
+    // execute!(terminal.backend_mut(), crossterm::event::DisableMouseCapture)?;
+    Ok(())
+}
+
+fn init_utf8_console() -> Result<()> {
+    // Set console to UTF-8 via chcp
+    let _ = std::process::Command::new("chcp")
+        .args(["65001"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
     Ok(())
 }
 
 fn main() -> Result<()> {
+    // Initialize UTF-8 console
+    let _ = init_utf8_console();
+
     let config = WstConfig::load_default()?;
 
     enable_raw_mode()?;
@@ -392,19 +641,14 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let state = AppState::new(config)?;
-
+    let state = AppState::new(config);
     let result = run_app(&mut terminal, state);
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
     result?;
 
     println!("WST exited. Goodbye!");
-
     Ok(())
 }

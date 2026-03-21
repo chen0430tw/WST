@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::collections::VecDeque;
-use wst_backend::{Backend, BackendError, CmdBackend, CygctlBackend, PwshBackend};
+use wst_backend::{Backend, CmdBackend, CygctlBackend, PwshBackend};
 use wst_config::WstConfig;
 use wst_protocol::{BackendKind, ExecRequest, SessionEvent, SessionId, TaskId};
 
@@ -67,6 +67,10 @@ impl History {
 
     pub fn iter(&self) -> impl Iterator<Item = &HistoryEntry> {
         self.entries.iter()
+    }
+
+    pub fn commands(&self) -> Vec<String> {
+        self.entries.iter().map(|e| e.command.clone()).collect()
     }
 
     pub fn search(&self, prefix: &str) -> Vec<&str> {
@@ -143,7 +147,6 @@ impl WstCore {
             return Err(anyhow!("empty command"));
         }
 
-        // Add to history
         self.history.add(command.clone());
 
         let session = self.ensure_session()?;
@@ -174,7 +177,8 @@ impl WstCore {
 
     pub fn tick(&mut self) -> Result<Vec<SessionEvent>> {
         if let Some(session) = self.session {
-            Ok(self.backend.poll_events(session).map_err(|e| anyhow!("{}", e))?)
+            let events = self.backend.poll_events(session).map_err(|e| anyhow!("{}", e))?;
+            Ok(events)
         } else {
             Ok(vec![])
         }
@@ -192,8 +196,20 @@ impl WstCore {
         &self.history
     }
 
-    pub fn history_mut(&mut self) -> &mut History {
-        &mut self.history
+    pub fn history_commands(&self) -> Vec<String> {
+        self.history.commands()
+    }
+
+    pub fn history_prev(&mut self) -> Option<String> {
+        self.history.prev().map(|s| s.to_string())
+    }
+
+    pub fn history_next(&mut self) -> Option<String> {
+        self.history.next().map(|s| s.to_string())
+    }
+
+    pub fn history_reset(&mut self) {
+        self.history.reset();
     }
 
     pub fn switch_backend(&mut self, kind: BackendKind) -> Result<()> {
@@ -209,7 +225,9 @@ impl WstCore {
 
         self.backend = new_backend;
         self.backend_kind = kind;
-        self.session = None; // Reset session on backend switch
+        self.session = None;
+        // Clear all old backend state
+        self.backend.reset();
         Ok(())
     }
 }

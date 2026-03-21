@@ -40,4 +40,7 @@ pub enum SessionEvent {
         task_id: TaskId,
         status: TaskStatus,
     },
+    Debug {
+        message: String,
+    },
 }

@@ -16,7 +16,7 @@ pub struct WstConfig {
 impl Default for WstConfig {
     fn default() -> Self {
         Self {
-            default_backend: BackendKind::Cygctl,
+            default_backend: BackendKind::Cmd,
             cygctl_path: "./cygctl.exe".to_string(),
             fullscreen: true,
             hotkey: "Ctrl+Alt+Space".to_string(),

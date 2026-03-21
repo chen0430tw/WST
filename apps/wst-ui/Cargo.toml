@@ -10,9 +10,12 @@ anyhow.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+windows.workspace = true
 
 wst-core = { path = "../../crates/wst-core" }
 wst-config = { path = "../../crates/wst-config" }
 wst-protocol = { path = "../../crates/wst-protocol" }
 wst-backend = { path = "../../crates/wst-backend" }
 wst-hotkey = { path = "../../crates/wst-hotkey" }
+unicode-width = "0.2.2"
