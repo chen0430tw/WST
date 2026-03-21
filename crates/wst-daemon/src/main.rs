@@ -119,12 +119,14 @@ async fn main() -> Result<()> {
 fn init_logging() {
     use tracing_subscriber::fmt;
     use tracing_subscriber::prelude::*;
-    use tracing_appender::non_blocking;
+    use std::sync::Mutex;
 
-    // Create log file in project directory
-    let log_file = std::fs::File::create("wst-daemon.log")
-        .expect("Failed to create log file");
-    let (non_blocking, _guard) = non_blocking(log_file);
+    // Create log file that persists for the lifetime of the program
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("wst-daemon.log")
+        .expect("Failed to open log file");
 
     // Set up subscriber with both console and file output
     let subscriber = tracing_subscriber::registry()
@@ -139,7 +141,7 @@ fn init_logging() {
         )
         .with(
             fmt::layer()
-                .with_writer(non_blocking)
+                .with_writer(Mutex::new(log_file))
                 .with_target(false)
                 .with_thread_ids(false)
                 .with_file(false)
@@ -148,9 +150,6 @@ fn init_logging() {
         );
 
     subscriber.init();
-
-    // Keep the guard alive for the lifetime of the program
-    std::mem::forget(_guard);
 }
 
 /// Print usage information
