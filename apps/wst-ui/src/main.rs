@@ -16,6 +16,8 @@ fn set_windows_terminal_fullscreen(fullscreen: bool) {
     use winput::Vk;
     use std::thread;
     use std::time::Duration;
+    use std::fs::OpenOptions;
+    use std::io::Write;
 
     unsafe {
         let hwnd = GetConsoleWindow();
@@ -23,12 +25,18 @@ fn set_windows_terminal_fullscreen(fullscreen: bool) {
         // Bring window to foreground first
         if !hwnd.is_invalid() {
             let _ = SetForegroundWindow(hwnd);
-            thread::sleep(Duration::from_millis(150));
+            thread::sleep(Duration::from_millis(300));
         }
 
         // Send F11 to toggle Windows Terminal fullscreen
         let _ = winput::send(Vk::F11);
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(500));
+
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("C:\\Users\\Administrator\\WST\\wst_debug.log")
+            .and_then(|mut f| writeln!(f, "set_windows_terminal_fullscreen: F11 sent"));
     }
 }
 
@@ -36,19 +44,89 @@ fn set_windows_terminal_fullscreen(fullscreen: bool) {
 #[cfg(windows)]
 fn set_legacy_console_fullscreen() {
     use winput::{Vk, Action, Input};
+    use windows::Win32::System::Diagnostics::ToolHelp::*;
     use std::thread;
     use std::time::Duration;
+    use std::fs::OpenOptions;
+    use std::io::Write;
 
-    // Send Alt+Enter for legacy console fullscreen
-    thread::sleep(Duration::from_millis(100));
+    // Get parent process name to detect if running in Windows Terminal
+    let parent_name = unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        let mut parent_name = String::from("Unknown");
 
-    let inputs = [
-        Input::from_vk(Vk::LeftMenu, Action::Press),   // Alt down
-        Input::from_vk(Vk::Enter, Action::Press),      // Enter down
-        Input::from_vk(Vk::Enter, Action::Release),    // Enter up
-        Input::from_vk(Vk::LeftMenu, Action::Release), // Alt up
-    ];
-    let _ = winput::send_inputs(&inputs);
+        if let Ok(snapshot) = snapshot {
+            let mut entry = PROCESSENTRY32::default();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+            let current_pid = std::process::id();
+
+            if Process32First(snapshot, &mut entry).is_ok() {
+                while Process32Next(snapshot, &mut entry).is_ok() {
+                    if entry.th32ProcessID == current_pid {
+                        let parent_id = entry.th32ParentProcessID;
+                        // Restart search to find parent
+                        let mut entry2 = PROCESSENTRY32::default();
+                        entry2.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+
+                        if Process32First(snapshot, &mut entry2).is_ok() {
+                            while Process32Next(snapshot, &mut entry2).is_ok() {
+                                if entry2.th32ProcessID == parent_id {
+                                    let name_bytes: Vec<u8> = entry2.szExeFile
+                                        .iter()
+                                        .take_while(|&&x| x != 0)
+                                        .map(|&x| x as u8)
+                                        .collect();
+                                    parent_name = String::from_utf8_lossy(&name_bytes).to_string();
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        parent_name
+    };
+
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("C:\\Users\\Administrator\\WST\\wst_debug.log")
+        .and_then(|mut f| writeln!(f, "Parent process: {}", parent_name));
+
+    thread::sleep(Duration::from_millis(500));
+
+    // Use F11 for Windows Terminal, Alt+Enter for native cmd
+    if parent_name.contains("WindowsTerminal.exe") || parent_name.contains("wt.exe") {
+        // Windows Terminal: F11 already sent before EnterAlternateScreen, do nothing here
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("C:\\Users\\Administrator\\WST\\wst_debug.log")
+            .and_then(|mut f| writeln!(f, "Windows Terminal detected - F11 already sent, skipping"));
+        return;
+    } else {
+        // Native cmd: use Alt+Enter
+        let inputs = [
+            Input::from_vk(Vk::LeftMenu, Action::Press),   // Alt down
+            Input::from_vk(Vk::Enter, Action::Press),      // Enter down
+            Input::from_vk(Vk::Enter, Action::Release),    // Enter up
+            Input::from_vk(Vk::LeftMenu, Action::Release), // Alt up
+        ];
+
+        let result = winput::send_inputs(&inputs);
+
+        // Debug log
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("C:\\Users\\Administrator\\WST\\wst_debug.log")
+            .and_then(|mut f| {
+                writeln!(f, "Alt+Enter sent, result: {:?}", result)?;
+                writeln!(f, "Number of inputs: {}", inputs.len())
+            });
+    }
 }
 use ratatui::{
     backend::CrosstermBackend,
@@ -673,16 +751,7 @@ fn main() -> Result<()> {
     let _ = init_utf8_console();
 
     let config = WstConfig::load_default()?;
-
-    // Parse command-line args (overrides config)
-    let args: Vec<String> = std::env::args().collect();
-    let fullscreen_enabled = if args.iter().any(|a| a == "-F" || a == "--fullscreen") {
-        true
-    } else if args.iter().any(|a| a == "--no-fullscreen") {
-        false
-    } else {
-        config.fullscreen
-    };
+    let fullscreen_enabled = config.fullscreen;
 
     // Enable F11 fullscreen BEFORE entering alternate screen
     // Windows Terminal's F11 works at window level, not terminal level
@@ -708,12 +777,6 @@ fn main() -> Result<()> {
     let result = run_app(&mut terminal, state);
 
     disable_raw_mode()?;
-
-    // Disable F11 fullscreen after leaving alternate screen
-    #[cfg(windows)]
-    if fullscreen_enabled {
-        set_windows_terminal_fullscreen(false);
-    }
 
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
