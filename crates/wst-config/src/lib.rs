@@ -10,6 +10,7 @@ pub struct WstConfig {
     pub default_backend: BackendKind,
     pub cygctl_path: String,
     pub fullscreen: bool,
+    pub alternate_screen: bool,
     pub hotkey: String,
 
     // Second stage: Daemon settings
@@ -35,6 +36,7 @@ impl Default for WstConfig {
             default_backend: BackendKind::Cmd,
             cygctl_path: "./cygctl.exe".to_string(),
             fullscreen: true,
+            alternate_screen: true,
             hotkey: "Ctrl+Alt+F12".to_string(),
 
             // Second stage defaults

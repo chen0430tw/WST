@@ -478,6 +478,8 @@ impl AppState {
 
     fn add_output(&mut self, line: OutputLine) {
         self.output.push(line);
+        // Auto-scroll to bottom so new output is always visible
+        self.scroll_to_bottom();
     }
 }
 
@@ -534,10 +536,13 @@ fn draw_ui(f: &mut Frame, state: &mut AppState) {
     let area = chunks[1];
     let buf = f.buffer_mut();
 
+    let text_width = area.width;
+    let reserved = if state.debug_mode { 2u16 } else { 1u16 };
+    let output_rows = area.height.saturating_sub(reserved);
+
     // Calculate which output lines to show
     let output_len = state.output.len();
-    let max_output_y = area.y + area.height - 1; // Bottom of area
-    let visible_count = (max_output_y - area.y + 1) as usize;
+    let visible_count = output_rows as usize;
     let (start, count) = if output_len <= visible_count {
         (0, output_len)
     } else {
@@ -545,10 +550,12 @@ fn draw_ui(f: &mut Frame, state: &mut AppState) {
         (output_len - visible_count - offset, visible_count)
     };
 
-    // Render output lines from top
+    // Render output lines; y tracks the next free row after output
+    let output_area_bottom = area.y + output_rows.saturating_sub(1);
+    let text_right = area.x + text_width;
     let mut y = area.y;
     for line in state.output.iter().skip(start).take(count) {
-        if y > max_output_y {
+        if y > output_area_bottom {
             break;
         }
         let style = if line.is_error {
@@ -561,46 +568,47 @@ fn draw_ui(f: &mut Frame, state: &mut AppState) {
         let text = line.text.replace('\t', "        ");
         let mut col = area.x;
         for ch in text.chars() {
-            if col < area.x + area.width {
-                buf.get_mut(col, y).set_char(ch).set_style(style.clone());
-                col += ch.width().unwrap_or(1) as u16;
+            let w = ch.width().unwrap_or(1) as u16;
+            if col + w > text_right {
+                break;
             }
+            buf.get_mut(col, y).set_char(ch).set_style(style);
+            col += w;
         }
         y += 1;
     }
 
-    // Calculate input line position (right after output, but not past bottom)
-    let input_y = if state.debug_mode {
-        (y + 2).min(area.y + area.height - 1) // +1 for debug line, +1 to move past it
+    // Place debug and input right after last output line (clamped to area bounds)
+    let (debug_y, input_y) = if state.debug_mode {
+        let d = y.min(area.y + area.height - 2);
+        let i = (y + 1).min(area.y + area.height - 1);
+        (d, i)
     } else {
-        (y + 1).min(area.y + area.height - 1)
+        (0, y.min(area.y + area.height - 1))
     };
 
-    // Add debug info before input if debug mode is on
+    // Add debug info on its row
     if state.debug_mode {
-        let debug_y = input_y.saturating_sub(1);
-        if debug_y >= area.y {
-            let backend_name = if let Ok(core) = state.core.try_lock() {
-                format!("{:?}", core.default_backend())
-            } else {
-                "Unknown".to_string()
-            };
-            let debug_info = format!(
-                "[DEBUG] b:{} enc:{} l:{} s:{} t:{:?}",
-                backend_name,
-                state.backend_encoding,
-                state.lines_received,
-                state.scroll_offset,
-                state.current_task_id
-            );
-            let mut col = area.x;
-            for ch in debug_info.chars() {
-                if col < area.x + area.width {
-                    buf.get_mut(col, debug_y)
-                        .set_char(ch)
-                        .set_style(Style::default().fg(Color::Yellow));
-                    col += ch.width().unwrap_or(1) as u16;
-                }
+        let backend_name = if let Ok(core) = state.core.try_lock() {
+            format!("{:?}", core.default_backend())
+        } else {
+            "Unknown".to_string()
+        };
+        let debug_info = format!(
+            "[DEBUG] b:{} enc:{} l:{} s:{} t:{:?}",
+            backend_name,
+            state.backend_encoding,
+            state.lines_received,
+            state.scroll_offset,
+            state.current_task_id
+        );
+        let mut col = area.x;
+        for ch in debug_info.chars() {
+            if col < area.x + area.width {
+                buf.get_mut(col, debug_y)
+                    .set_char(ch)
+                    .set_style(Style::default().fg(Color::Yellow));
+                col += ch.width().unwrap_or(1) as u16;
             }
         }
     }
@@ -637,6 +645,60 @@ fn draw_ui(f: &mut Frame, state: &mut AppState) {
 
 enum AppEvent {
     Backend(SessionEvent),
+    MouseScroll(i32), // positive = scroll up (older content), negative = scroll down
+}
+
+/// Install a WH_MOUSE_LL global hook that sends wheel events to `tx`.
+/// Calls CallNextHookEx so text selection and all other mouse behaviour is unaffected.
+#[cfg(windows)]
+fn install_mouse_hook(tx: mpsc::UnboundedSender<AppEvent>) {
+    use std::sync::OnceLock;
+    use windows::Win32::Foundation::{HWND, LRESULT, LPARAM, WPARAM};
+    use windows::Win32::System::Console::GetConsoleWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, GetMessageW, SetWindowsHookExW,
+        UnhookWindowsHookEx, MSG, MSLLHOOKSTRUCT, HHOOK,
+        WH_MOUSE_LL, WM_MOUSEWHEEL,
+    };
+
+    static TX: OnceLock<mpsc::UnboundedSender<AppEvent>> = OnceLock::new();
+    static CONSOLE_HWND: OnceLock<isize> = OnceLock::new();
+
+    unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL {
+            let ms = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+            // Filter: only handle wheel events on our console window
+            use windows::Win32::UI::WindowsAndMessaging::WindowFromPoint;
+            let hwnd_at = WindowFromPoint(ms.pt);
+            if let Some(&console_hwnd) = CONSOLE_HWND.get() {
+                if hwnd_at.0 as isize == console_hwnd {
+                    let delta = (ms.mouseData >> 16) as i16;
+                    if let Some(tx) = TX.get() {
+                        let _ = tx.send(AppEvent::MouseScroll(delta as i32));
+                    }
+                }
+            }
+        }
+        CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+    }
+
+    let _ = TX.set(tx);
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        let _ = CONSOLE_HWND.set(hwnd.0 as isize);
+    }
+
+    std::thread::spawn(|| unsafe {
+        let hook = match SetWindowsHookExW(WH_MOUSE_LL, Some(hook_proc), None, 0) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+            // No TranslateMessage/DispatchMessage needed — hook callbacks fire during GetMessageW
+        }
+        let _ = UnhookWindowsHookEx(hook);
+    });
 }
 
 async fn run_event_loop(
@@ -662,8 +724,10 @@ fn run_app(
     let (tx, mut rx) = mpsc::unbounded_channel();
     let core_clone = state.core.clone();
 
-    // Don't enable mouse capture - let WT handle text selection naturally
-    // Mouse wheel is converted to Up/Down keys by WT's Alternate Scroll Mode
+    // Install low-level mouse hook for scroll wheel support in conhost.
+    // Uses CallNextHookEx so text selection is completely unaffected.
+    #[cfg(windows)]
+    install_mouse_hook(tx.clone());
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.spawn(run_event_loop(core_clone, tx));
@@ -704,6 +768,13 @@ fn run_app(
                 Ok(AppEvent::Backend(SessionEvent::Debug { message })) => {
                     if state.debug_mode {
                         state.add_output(OutputLine::system(format!("[DEBUG] {}", message)));
+                    }
+                }
+                Ok(AppEvent::MouseScroll(delta)) => {
+                    if delta > 0 {
+                        state.scroll_output_up(3);
+                    } else {
+                        state.scroll_output_down(3);
                     }
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
@@ -767,6 +838,7 @@ fn main() -> Result<()> {
 
     let config = WstConfig::load_default()?;
     let fullscreen_enabled = config.fullscreen;
+    let alternate_screen = config.alternate_screen;
 
     // When started hidden by the daemon (SW_HIDE), the window is not visible yet.
     // The daemon will handle fullscreen via PostMessage after showing the window.
@@ -792,7 +864,13 @@ fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    if alternate_screen {
+        execute!(stdout, EnterAlternateScreen)?;
+    }
+    // Enable alternate scroll mode for Windows Terminal (converts wheel to Up/Down)
+    print!("\x1b[?1007h");
+    use std::io::Write;
+    io::stdout().flush()?;
 
     // Try Alt+Enter for legacy console fullscreen (after alternate screen)
     #[cfg(windows)]
@@ -806,9 +884,15 @@ fn main() -> Result<()> {
     let state = AppState::new(config);
     let result = run_app(&mut terminal, state);
 
+    // Disable alternate scroll mode before leaving
+    print!("\x1b[?1007l");
+    io::stdout().flush()?;
+
     disable_raw_mode()?;
 
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    if alternate_screen {
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    }
 
     result?;
 
