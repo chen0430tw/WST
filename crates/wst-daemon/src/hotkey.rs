@@ -6,8 +6,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 
-#[cfg(windows)]
-use windows::Win32::UI::WindowsAndMessaging::*;
 
 // Hotkey modifier constants
 const MOD_ALT: u32 = 0x0001;
@@ -101,8 +99,8 @@ pub async fn run_hotkey_listener(
 ) -> Result<()> {
     tracing::info!("Hotkey listener starting");
 
-    // Track if UI is currently running
-    let mut ui_process: Option<std::process::Child> = None;
+    // Track the PID of the launched wst-ui process
+    let mut ui_pid: Option<u32> = None;
 
     while !state.is_shutting_down().await {
         tokio::select! {
@@ -114,21 +112,21 @@ pub async fn run_hotkey_listener(
 
                         if visible {
                             // Show/launch UI
-                            launch_or_focus_ui(&mut ui_process).await?;
+                            launch_or_focus_ui(&mut ui_pid).await?;
                         } else {
                             // Hide UI (close it)
-                            close_ui(&mut ui_process).await?;
+                            close_ui(&mut ui_pid).await?;
                         }
                     }
                     HotkeyEvent::ShowFrontend => {
                         state.set_frontend_visible(true).await;
                         tracing::info!("Hotkey: Frontend shown");
-                        launch_or_focus_ui(&mut ui_process).await?;
+                        launch_or_focus_ui(&mut ui_pid).await?;
                     }
                     HotkeyEvent::HideFrontend => {
                         state.set_frontend_visible(false).await;
                         tracing::info!("Hotkey: Frontend hidden");
-                        close_ui(&mut ui_process).await?;
+                        close_ui(&mut ui_pid).await?;
                     }
                     HotkeyEvent::Custom(id) => {
                         tracing::debug!("Hotkey: Custom event {}", id);
@@ -142,8 +140,8 @@ pub async fn run_hotkey_listener(
     }
 
     // Clean up UI process on exit
-    if let Some(mut child) = ui_process {
-        let _ = child.kill();
+    if let Some(pid) = ui_pid {
+        kill_ui_pid(pid);
     }
 
     tracing::info!("Hotkey listener stopped");
@@ -151,78 +149,124 @@ pub async fn run_hotkey_listener(
 }
 
 /// Launch or focus the WST UI
-async fn launch_or_focus_ui(ui_process: &mut Option<std::process::Child>) -> Result<()> {
-    use std::process::Command;
-
+async fn launch_or_focus_ui(ui_pid: &mut Option<u32>) -> Result<()> {
     tracing::info!("=== launch_or_focus_ui() called ===");
 
-    // Check if UI is already running
-    if let Some(child) = ui_process {
-        tracing::info!("Checking existing UI process with PID: {:?}", child.id());
-        match child.try_wait() {
-            Ok(None) => {
-                // Process still running - show the window
-                tracing::info!("UI process still running (None = still alive), calling show_ui_window()");
-                show_ui_window()?;
-                return Ok(());
-            }
-            Ok(Some(status)) => {
-                tracing::info!("UI process exited with status: {:?}", status);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to wait for UI process: {}", e);
-            }
+    // If we have a tracked PID and it's still alive, re-show the window.
+    // It was hidden while fullscreen, so SW_SHOW restores it directly (first_show=false).
+    if let Some(pid) = *ui_pid {
+        tracing::info!("Checking existing UI process with PID: {}", pid);
+        if is_pid_alive(pid) {
+            tracing::info!("UI process still running, re-showing window");
+            show_ui_window(false)?;
+            return Ok(());
+        } else {
+            tracing::info!("UI process {} has exited, will relaunch", pid);
+            *ui_pid = None;
         }
     } else {
         tracing::info!("No existing UI process tracked");
     }
 
-    // Check if wst-ui is already running (maybe started separately)
-    tracing::info!("Checking if wst-ui.exe is running externally");
-    if is_ui_process_running() {
-        tracing::info!("WST UI is already running (external), calling show_ui_window()");
-        show_ui_window()?;
-        return Ok(());
-    } else {
-        tracing::info!("wst-ui.exe not found running externally");
-    }
+    // Delete stale HWND file before launching so we know when the new instance writes it
+    let hwnd_path = std::env::temp_dir().join("wst_ui_hwnd.txt");
+    let _ = std::fs::remove_file(&hwnd_path);
 
-    // Launch UI from the correct directory (project root)
-    // This ensures it can find config files
     let exe_path = find_wst_ui_executable();
     tracing::info!("UI executable path: {:?}", exe_path);
 
-    // Get the absolute path and set working directory to project root
     let exe_abs = std::path::Path::new(&exe_path)
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("Failed to resolve UI path: {}", e))?;
 
-    // Set working directory to the project root (where wst.toml would be)
     let project_root = exe_abs.parent()
         .and_then(|p| p.parent())
         .unwrap_or_else(|| std::path::Path::new("."));
 
     tracing::info!("Working directory: {:?}", project_root);
 
-    let child = Command::new(&exe_path)
-        .current_dir(project_root)
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to launch UI: {}", e))?;
+    // Launch wst-ui hidden (STARTF_USESHOWWINDOW + SW_HIDE + CREATE_NEW_CONSOLE)
+    // so there is no visible console window flash before we go fullscreen.
+    #[cfg(windows)]
+    let launched_pid = {
+        use windows::Win32::System::Threading::{
+            CreateProcessW, PROCESS_CREATION_FLAGS, STARTUPINFOW, STARTF_USESHOWWINDOW,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+        use windows::core::PWSTR;
+        use std::os::windows::ffi::OsStrExt;
 
-    tracing::info!("WST UI launched with PID: {:?}", child.id());
+        let exe_wide: Vec<u16> = exe_abs.as_os_str()
+            .encode_wide().chain(std::iter::once(0)).collect();
+        let dir_wide: Vec<u16> = project_root.as_os_str()
+            .encode_wide().chain(std::iter::once(0)).collect();
 
-    *ui_process = Some(child);
+        let mut si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            dwFlags: STARTF_USESHOWWINDOW,
+            wShowWindow: SW_HIDE.0 as u16,
+            ..Default::default()
+        };
+        let mut pi = windows::Win32::System::Threading::PROCESS_INFORMATION::default();
+
+        const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+
+        unsafe {
+            CreateProcessW(
+                windows::core::PCWSTR(exe_wide.as_ptr()),
+                PWSTR::null(),
+                None, None, false,
+                PROCESS_CREATION_FLAGS(CREATE_NEW_CONSOLE),
+                None,
+                windows::core::PCWSTR(dir_wide.as_ptr()),
+                &mut si,
+                &mut pi,
+            ).map_err(|e| anyhow::anyhow!("Failed to launch UI: {}", e))?;
+
+            let pid = pi.dwProcessId;
+            let _ = windows::Win32::Foundation::CloseHandle(pi.hThread);
+            let _ = windows::Win32::Foundation::CloseHandle(pi.hProcess);
+            pid
+        }
+    };
+    #[cfg(not(windows))]
+    let launched_pid = {
+        use std::process::Command;
+        Command::new(&exe_path)
+            .current_dir(project_root)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to launch UI: {}", e))?
+            .id()
+    };
+
+    tracing::info!("WST UI launched with PID: {}", launched_pid);
+    *ui_pid = Some(launched_pid);
+
+    // Wait for wst-ui to write its HWND (up to 5 seconds)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !hwnd_path.exists() {
+        if std::time::Instant::now() > deadline {
+            tracing::warn!("Timed out waiting for wst-ui HWND file");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    if hwnd_path.exists() {
+        tracing::info!("HWND file ready, showing wst-ui fullscreen (first launch)");
+        show_ui_window(true)?;
+    }
+
     Ok(())
 }
 
-/// Close the WST UI
-async fn close_ui(ui_process: &mut Option<std::process::Child>) -> Result<()> {
+/// Close the WST UI (hide window, keep process alive)
+async fn close_ui(ui_pid: &mut Option<u32>) -> Result<()> {
     tracing::info!("=== close_ui() called ===");
 
-    if let Some(child) = ui_process {
-        tracing::info!("UI process exists with PID: {:?}", child.id());
+    if let Some(pid) = *ui_pid {
+        tracing::info!("UI process PID: {}", pid);
 
-        // Try to hide the window instead of killing the process
         #[cfg(windows)]
         {
             tracing::info!("Attempting to hide WST UI window (keeping process alive)");
@@ -232,202 +276,115 @@ async fn close_ui(ui_process: &mut Option<std::process::Child>) -> Result<()> {
                     return Ok(());
                 }
                 Err(e) => {
-                    tracing::warn!("Hide window failed: {}, falling back to kill process", e);
+                    tracing::warn!("Hide window failed: {}, killing process", e);
+                    kill_ui_pid(pid);
+                    *ui_pid = None;
                 }
             }
         }
-
-        // Fallback: kill the process
-        tracing::info!("Closing UI (PID: {:?})", child.id());
-        let _ = child.kill();
-        let _ = child.wait();
-        *ui_process = None;
+        #[cfg(not(windows))]
+        {
+            kill_ui_pid(pid);
+            *ui_pid = None;
+        }
     }
     Ok(())
 }
 
-/// Show the WST UI window using Windows API
+/// Show the WST UI window using Windows API.
+/// `first_show`: true when window is freshly launched (needs fullscreen setup),
+///               false when re-showing a previously hidden window (already fullscreen).
 #[cfg(windows)]
-fn show_ui_window() -> Result<()> {
-    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SetForegroundWindow, SW_RESTORE, GetWindowTextW};
-    use windows::Win32::Foundation::{HWND, LPARAM, BOOL};
-    use winput::{Vk, Action, Input};
+fn show_ui_window(first_show: bool) -> Result<()> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        ShowWindow, SetForegroundWindow, IsWindow, BringWindowToTop,
+        SetWindowPos, SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE, SW_SHOW,
+        PostMessageW, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    };
+    use windows::Win32::Foundation::{WPARAM, LPARAM};
     use std::thread;
     use std::time::Duration;
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
 
-    tracing::info!("=== show_ui_window() called ===");
+    tracing::info!("=== show_ui_window(first_show={}) called ===", first_show);
+
+    let hwnd = read_ui_hwnd()?;
+    tracing::info!("wst-ui HWND from file: {:?}", hwnd);
 
     unsafe {
-        // Use static mut to pass data to callback (unsafe but works for this case)
-        static mut FOUND_HWND: Option<HWND> = None;
-        static mut WINDOW_COUNT: u32 = 0;
-
-        unsafe extern "system" fn enum_callback(hwnd: HWND, _lparam: LPARAM) -> BOOL {
-            WINDOW_COUNT += 1;
-
-            // Get window title
-            let mut buffer = [u16::default(); 512];
-            let len = GetWindowTextW(hwnd, &mut buffer);
-
-            if len > 0 {
-                let title_string = OsString::from_wide(&buffer[..len as usize])
-                    .to_string_lossy()
-                    .to_string();
-
-                // Only log non-IME windows to reduce noise
-                if !title_string.contains("IME") && !title_string.contains("MSCTF") {
-                    tracing::info!("Window #{}: '{}'", WINDOW_COUNT, title_string);
-                }
-
-                // Check if title contains "WST" - be more flexible
-                if title_string.contains("WST") {
-                    tracing::info!("Found WST window: '{}' with hwnd: {:?}", title_string, hwnd);
-                    FOUND_HWND = Some(hwnd);
-                    return BOOL::from(false); // FALSE = Stop enumeration
-                }
-            }
-            BOOL::from(true) // TRUE = Continue enumeration
+        if !IsWindow(hwnd).as_bool() {
+            return Err(anyhow::anyhow!("wst-ui window is no longer valid"));
         }
 
-        FOUND_HWND = None;
-        WINDOW_COUNT = 0;
-        let enum_result = EnumWindows(Some(enum_callback), LPARAM(0));
-        tracing::info!("EnumWindows result: {:?}, Total windows checked: {}", enum_result, WINDOW_COUNT);
+        // Hide from taskbar and Alt+Tab by removing WS_EX_APPWINDOW and adding WS_EX_TOOLWINDOW
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+        };
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        SetWindowLongW(hwnd, GWL_EXSTYLE,
+            (ex_style & !(WS_EX_APPWINDOW.0 as i32)) | WS_EX_TOOLWINDOW.0 as i32);
 
-        if let Some(hwnd) = FOUND_HWND {
-            tracing::info!("Window is valid, proceeding to show");
+        if first_show {
+            // First launch: window is hidden and not yet fullscreen.
+            // Move off-screen first so the user doesn't see the normal-size flash,
+            // then show it, wait for conhost to be ready, and toggle fullscreen.
+            let _ = SetWindowPos(hwnd, None, -32000, -32000, 0, 0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
 
-            // Show and bring to front
-            tracing::info!("Calling ShowWindow with SW_RESTORE");
-            let result = ShowWindow(hwnd, SW_RESTORE);
-            tracing::info!("ShowWindow result: {:?}", result);
+            thread::sleep(Duration::from_millis(300));
 
-            tracing::info!("Calling SetForegroundWindow");
-            let fg_result = SetForegroundWindow(hwnd);
-            tracing::info!("SetForegroundWindow result: {:?}", fg_result);
-
-            thread::sleep(Duration::from_millis(100));
-
-            // Send F11 to toggle Windows Terminal fullscreen
-            tracing::info!("Sending F11 keystroke for Windows Terminal fullscreen");
-            let f11_result = winput::send(Vk::F11);
-            tracing::info!("F11 send result: {:?}", f11_result);
+            let _ = PostMessageW(hwnd, WM_KEYDOWN,    WPARAM(0x7A), LPARAM(0x00570001));
+            let _ = PostMessageW(hwnd, WM_KEYUP,      WPARAM(0x7A), LPARAM(0xC0570001u64 as _));
             thread::sleep(Duration::from_millis(200));
-
-            // Send Alt+Enter to toggle legacy console fullscreen
-            tracing::info!("Sending Alt+Enter for legacy console fullscreen");
-            let inputs = vec![
-                Input::from_vk(Vk::LeftMenu, Action::Press),
-                Input::from_vk(Vk::Enter, Action::Press),
-                Input::from_vk(Vk::Enter, Action::Release),
-                Input::from_vk(Vk::LeftMenu, Action::Release),
-            ];
-            tracing::info!("Alt+Enter inputs prepared ({} inputs)", inputs.len());
-            let alt_enter_result = winput::send_inputs(&inputs);
-            tracing::info!("Alt+Enter send result: {:?}", alt_enter_result);
-
-            tracing::info!("=== show_ui_window() completed successfully ===");
-            return Ok(());
+            let _ = PostMessageW(hwnd, WM_SYSKEYDOWN, WPARAM(0x0D), LPARAM(0x201C0001));
+            let _ = PostMessageW(hwnd, WM_SYSKEYUP,   WPARAM(0x0D), LPARAM(0xC01C0001u64 as _));
+        } else {
+            // Re-show: window was hidden while already fullscreen (SW_HIDE preserves state).
+            // Just show it — it comes back fullscreen directly.
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
         }
-
-        tracing::warn!("Could not find WST UI window");
-        Err(anyhow::anyhow!("UI window not found"))
     }
+
+    tracing::info!("=== show_ui_window() completed successfully ===");
+    Ok(())
 }
 
-/// Hide the WST UI window using Windows API
-/// For fullscreen console windows, we need to send F11/Alt+Enter first
+/// Read the wst-ui HWND from the temp file written by wst-ui at startup
+#[cfg(windows)]
+fn read_ui_hwnd() -> Result<windows::Win32::Foundation::HWND> {
+    let path = std::env::temp_dir().join("wst_ui_hwnd.txt");
+    let raw: usize = std::fs::read_to_string(&path)
+        .map_err(|_| anyhow::anyhow!("wst-ui HWND file not found (is wst-ui running?)"))?
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("wst-ui HWND file is invalid"))?;
+    Ok(windows::Win32::Foundation::HWND(raw as *mut core::ffi::c_void))
+}
+
+/// Hide the WST UI window — just SW_HIDE, preserving the fullscreen state.
+/// When shown again via SW_SHOW, the window returns to fullscreen directly.
 #[cfg(windows)]
 fn hide_ui_window() -> Result<()> {
-    use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_HIDE, GetWindowTextW, GetWindowThreadProcessId};
-    use windows::Win32::Foundation::{HWND, LPARAM, BOOL};
-    use winput::{Vk, Action, Input};
-    use std::thread;
-    use std::time::Duration;
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, IsWindow};
 
     tracing::info!("=== hide_ui_window() called ===");
 
+    let hwnd = read_ui_hwnd()?;
+    tracing::info!("wst-ui HWND from file: {:?}", hwnd);
+
     unsafe {
-        // Use static mut to pass data to callback (unsafe but works for this case)
-        static mut FOUND_HWND: Option<HWND> = None;
-        static mut WINDOW_COUNT: u32 = 0;
-
-        unsafe extern "system" fn enum_callback(hwnd: HWND, _lparam: LPARAM) -> BOOL {
-            WINDOW_COUNT += 1;
-
-            // Get window title
-            let mut buffer = [u16::default(); 512];
-            let len = GetWindowTextW(hwnd, &mut buffer);
-
-            if len > 0 {
-                let title_string = OsString::from_wide(&buffer[..len as usize])
-                    .to_string_lossy()
-                    .to_string();
-
-                // Only log non-IME windows to reduce noise
-                if !title_string.contains("IME") && !title_string.contains("MSCTF") {
-                    tracing::info!("Window #{}: '{}'", WINDOW_COUNT, title_string);
-                }
-
-                // Check if title contains "WST" - be more flexible
-                if title_string.contains("WST") {
-                    tracing::info!("Found WST window: '{}' with hwnd: {:?}", title_string, hwnd);
-                    FOUND_HWND = Some(hwnd);
-                    return BOOL::from(false); // FALSE = Stop enumeration
-                }
-            }
-            BOOL::from(true) // TRUE = Continue enumeration
+        if !IsWindow(hwnd).as_bool() {
+            return Err(anyhow::anyhow!("wst-ui window is no longer valid"));
         }
-
-        FOUND_HWND = None;
-        WINDOW_COUNT = 0;
-        let enum_result = EnumWindows(Some(enum_callback), LPARAM(0));
-        tracing::info!("EnumWindows result: {:?}, Total windows checked: {}", enum_result, WINDOW_COUNT);
-
-        if let Some(hwnd) = FOUND_HWND {
-            tracing::info!("Window is valid, proceeding to hide");
-
-            // Bring window to foreground first
-            tracing::info!("Calling SetForegroundWindow");
-            let fg_result = SetForegroundWindow(hwnd);
-            tracing::info!("SetForegroundWindow result: {:?}", fg_result);
-            thread::sleep(Duration::from_millis(100));
-
-            // Send F11 to toggle Windows Terminal fullscreen (exit)
-            tracing::info!("Sending F11 keystroke to exit Windows Terminal fullscreen");
-            let f11_result = winput::send(Vk::F11);
-            tracing::info!("F11 send result: {:?}", f11_result);
-            thread::sleep(Duration::from_millis(200));
-
-            // Send Alt+Enter to toggle legacy console fullscreen (exit)
-            tracing::info!("Sending Alt+Enter to exit legacy console fullscreen");
-            let inputs = vec![
-                Input::from_vk(Vk::LeftMenu, Action::Press),
-                Input::from_vk(Vk::Enter, Action::Press),
-                Input::from_vk(Vk::Enter, Action::Release),
-                Input::from_vk(Vk::LeftMenu, Action::Release),
-            ];
-            tracing::info!("Alt+Enter inputs prepared ({} inputs)", inputs.len());
-            let alt_enter_result = winput::send_inputs(&inputs);
-            tracing::info!("Alt+Enter send result: {:?}", alt_enter_result);
-            thread::sleep(Duration::from_millis(200));
-
-            // Finally hide the window
-            tracing::info!("Calling ShowWindow with SW_HIDE");
-            let result = ShowWindow(hwnd, SW_HIDE);
-            tracing::info!("ShowWindow SW_HIDE result: {:?}", result);
-
-            tracing::info!("=== hide_ui_window() completed successfully ===");
-            return Ok(());
-        }
-
-        tracing::warn!("Could not find WST UI window");
-        Err(anyhow::anyhow!("UI window not found"))
+        let _ = ShowWindow(hwnd, SW_HIDE);
     }
+
+    tracing::info!("=== hide_ui_window() completed successfully ===");
+    Ok(())
 }
 
 /// Find window by title and show/hide it (non-Windows stub)
@@ -441,35 +398,56 @@ fn hide_ui_window() -> Result<()> {
     Err(anyhow::anyhow!("Window show/hide not supported on this platform"))
 }
 
-/// Check if wst-ui process is already running
+/// Check if a process with the given PID is still alive
 #[cfg(windows)]
-fn is_ui_process_running() -> bool {
-    use std::process::Command;
+fn is_pid_alive(pid: u32) -> bool {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::System::Threading::GetExitCodeProcess;
+    use windows::Win32::Foundation::STILL_ACTIVE;
 
-    // Use tasklist to check if wst-ui.exe is running
-    let output = Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq wst-ui.exe"])
-        .output();
-
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            // Check if output contains the process name (not just the header)
-            stdout.lines().count() > 1
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        match handle {
+            Ok(h) => {
+                let mut code: u32 = 0;
+                let alive = GetExitCodeProcess(h, &mut code).is_ok()
+                    && code == STILL_ACTIVE.0 as u32;
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+                alive
+            }
+            Err(_) => false,
         }
-        Err(_) => false,
     }
 }
 
 #[cfg(not(windows))]
-fn is_ui_process_running() -> bool {
+fn is_pid_alive(_pid: u32) -> bool {
     false
 }
 
-/// Find the wst-ui executable
+/// Kill the wst-ui process by PID
+#[cfg(windows)]
+fn kill_ui_pid(pid: u32) {
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    unsafe {
+        if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+            let _ = TerminateProcess(h, 1);
+            let _ = windows::Win32::Foundation::CloseHandle(h);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn kill_ui_pid(_pid: u32) {}
+
+/// Find the wst-ui executable (prefer debug builds during development)
 fn find_wst_ui_executable() -> String {
-    // Try multiple paths
     let paths = vec![
+        // Debug builds first
+        "target/debug/wst-ui.exe",
+        "../target/debug/wst-ui.exe",
+        "../../target/debug/wst-ui.exe",
+        // Release builds fallback
         "target/release/wst-ui.exe",
         "../target/release/wst-ui.exe",
         "../../target/release/wst-ui.exe",
@@ -482,8 +460,7 @@ fn find_wst_ui_executable() -> String {
         }
     }
 
-    // Default path
-    "target/release/wst-ui.exe".to_string()
+    "target/debug/wst-ui.exe".to_string()
 }
 
 /// Start the hotkey manager in a background thread using win-hotkeys

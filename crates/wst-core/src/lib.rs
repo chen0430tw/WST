@@ -256,14 +256,14 @@ impl BackendManager {
     }
 
     pub fn tick(&mut self) -> Result<Vec<SessionEvent>> {
-        let mut all_events = Vec::new();
-        for backend in self.backends.values_mut() {
+        let all_events = Vec::new();
+        for _backend in self.backends.values_mut() {
             // Poll events from all sessions managed by this backend
             // Note: This is simplified - a full implementation would track which sessions belong to which backend
             // For now, just poll the default backend
         }
         // Just poll default backend for now
-        let backend = self.get_backend(self.default_backend);
+        let _backend = self.get_backend(self.default_backend);
         // Would need to track active sessions
         Ok(all_events)
     }

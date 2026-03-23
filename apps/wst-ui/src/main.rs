@@ -10,7 +10,7 @@ use crossterm::{
 
 // Send F11 for Windows Terminal fullscreen (must be called BEFORE alternate screen)
 #[cfg(windows)]
-fn set_windows_terminal_fullscreen(fullscreen: bool) {
+fn set_windows_terminal_fullscreen(_fullscreen: bool) {
     use windows::Win32::System::Console::GetConsoleWindow;
     use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
     use winput::Vk;
@@ -144,8 +144,10 @@ use wst_config::WstConfig;
 use wst_core::WstCore;
 use wst_protocol::{BackendKind, SessionEvent, TaskStatus};
 
+#[allow(dead_code)]
 const INPUT_PROMPT: &str = ">";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+#[allow(dead_code)]
 const CP_UTF8: u32 = 65001;
 
 #[derive(Clone)]
@@ -750,13 +752,41 @@ fn main() -> Result<()> {
     // Initialize UTF-8 console
     let _ = init_utf8_console();
 
+    // Write our console HWND to a temp file so the daemon can find this window
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Console::GetConsoleWindow;
+        unsafe {
+            let hwnd = GetConsoleWindow();
+            if !hwnd.is_invalid() {
+                let path = std::env::temp_dir().join("wst_ui_hwnd.txt");
+                let _ = std::fs::write(&path, (hwnd.0 as usize).to_string());
+            }
+        }
+    }
+
     let config = WstConfig::load_default()?;
     let fullscreen_enabled = config.fullscreen;
+
+    // When started hidden by the daemon (SW_HIDE), the window is not visible yet.
+    // The daemon will handle fullscreen via PostMessage after showing the window.
+    // Skip self-managed fullscreen to avoid conflicting key presses.
+    #[cfg(windows)]
+    let self_manage_fullscreen = {
+        use windows::Win32::System::Console::GetConsoleWindow;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+        unsafe {
+            let hwnd = GetConsoleWindow();
+            !hwnd.is_invalid() && IsWindowVisible(hwnd).as_bool()
+        }
+    };
+    #[cfg(not(windows))]
+    let self_manage_fullscreen = true;
 
     // Enable F11 fullscreen BEFORE entering alternate screen
     // Windows Terminal's F11 works at window level, not terminal level
     #[cfg(windows)]
-    if fullscreen_enabled {
+    if fullscreen_enabled && self_manage_fullscreen {
         set_windows_terminal_fullscreen(true);
     }
 
@@ -766,7 +796,7 @@ fn main() -> Result<()> {
 
     // Try Alt+Enter for legacy console fullscreen (after alternate screen)
     #[cfg(windows)]
-    if fullscreen_enabled {
+    if fullscreen_enabled && self_manage_fullscreen {
         set_legacy_console_fullscreen();
     }
 
@@ -781,6 +811,9 @@ fn main() -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
     result?;
+
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(std::env::temp_dir().join("wst_ui_hwnd.txt"));
 
     println!("WST exited. Goodbye!");
     Ok(())

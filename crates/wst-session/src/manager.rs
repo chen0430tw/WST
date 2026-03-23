@@ -1,8 +1,8 @@
 use crate::{Result, SessionError, SessionState};
-use crate::session::{Session, SessionConfig, SessionSnapshot};
+use crate::session::{Session, SessionConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, Mutex};
+use tokio::sync::RwLock;
 use wst_protocol::{SessionId, TaskId};
 use crate::store::SessionStore;
 
@@ -40,8 +40,6 @@ pub struct SessionManager {
     current_session: Arc<RwLock<Option<SessionId>>>,
     /// Session store for persistence
     store: Option<SessionStore>,
-    /// Next session ID counter
-    next_id: Arc<Mutex<u64>>,
 }
 
 impl SessionManager {
@@ -66,7 +64,6 @@ impl SessionManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             current_session: Arc::new(RwLock::new(None)),
             store,
-            next_id: Arc::new(Mutex::new(1)),
         })
     }
 

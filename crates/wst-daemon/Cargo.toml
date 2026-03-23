@@ -35,5 +35,6 @@ windows = { workspace = true, features = [
     "Win32_System_Threading",
     "Win32_System_Pipes",
     "Win32_System_LibraryLoader",
+    "Win32_Security",
 ] }
 interprocess = "2.2"

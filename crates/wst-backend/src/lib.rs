@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::process::{Child, Command, Stdio};
 
 use thiserror::Error;
@@ -212,7 +212,7 @@ impl Backend for CmdBackend {
                             // Still running, put child back
                             task.child = Some(child);
                         }
-                        Err(e) => {
+                        Err(_) => {
                             task.child = Some(child);
                         }
                     }
