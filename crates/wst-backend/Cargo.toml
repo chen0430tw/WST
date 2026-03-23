@@ -8,5 +8,9 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
+encoding_rs = "0.8"
 
 wst-protocol = { path = "../wst-protocol" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Globalization"] }

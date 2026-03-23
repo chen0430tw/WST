@@ -198,6 +198,8 @@ impl WstCore {
 pub struct BackendManager {
     backends: std::collections::HashMap<BackendKind, Box<dyn Backend>>,
     default_backend: BackendKind,
+    /// Tracks which backend owns each session ID
+    session_owners: std::collections::HashMap<SessionId, BackendKind>,
 }
 
 impl BackendManager {
@@ -211,6 +213,7 @@ impl BackendManager {
         Self {
             backends,
             default_backend: config.default_backend,
+            session_owners: std::collections::HashMap::new(),
         }
     }
 
@@ -233,51 +236,57 @@ impl BackendManager {
     }
 
     pub fn ensure_session(&mut self) -> Result<SessionId> {
-        // Get default backend and ensure session
-        let backend = self.get_backend(self.default_backend);
-        backend.spawn_session().map_err(|e| anyhow!("{}", e))
+        let kind = self.default_backend;
+        let backend = self.get_backend(kind);
+        let sid = backend.spawn_session().map_err(|e| anyhow!("{}", e))?;
+        self.session_owners.insert(sid, kind);
+        Ok(sid)
     }
 
     pub fn create_session(&mut self) -> Result<SessionId> {
-        let backend = self.get_backend(self.default_backend);
-        backend.spawn_session().map_err(|e| anyhow!("{}", e))
+        let kind = self.default_backend;
+        let backend = self.get_backend(kind);
+        let sid = backend.spawn_session().map_err(|e| anyhow!("{}", e))?;
+        self.session_owners.insert(sid, kind);
+        Ok(sid)
     }
 
     pub fn exec(&mut self, session: SessionId, req: ExecRequest) -> Result<TaskId> {
-        // Find which backend owns this session
-        for backend in self.backends.values_mut() {
-            // Try to execute - if backend doesn't have this session, it will error
-            match backend.exec(session, req.clone()) {
-                Ok(task_id) => return Ok(task_id),
-                Err(_) => continue,
-            }
-        }
-        Err(anyhow!("Session not found"))
+        // Only run on the backend that owns this session
+        let kind = self.session_owners.get(&session).copied()
+            .unwrap_or(self.default_backend);
+        let backend = self.get_backend(kind);
+        backend.exec(session, req).map_err(|e| anyhow!("{}", e))
     }
 
     pub fn tick(&mut self) -> Result<Vec<SessionEvent>> {
-        let all_events = Vec::new();
-        for _backend in self.backends.values_mut() {
-            // Poll events from all sessions managed by this backend
-            // Note: This is simplified - a full implementation would track which sessions belong to which backend
-            // For now, just poll the default backend
+        let mut all_events = Vec::new();
+        // Collect (kind, session_ids) to avoid borrow issues
+        let mut by_kind: std::collections::HashMap<BackendKind, Vec<SessionId>> =
+            std::collections::HashMap::new();
+        for backend in self.backends.values() {
+            let kind = backend.kind();
+            let sids = backend.active_session_ids();
+            if !sids.is_empty() {
+                by_kind.entry(kind).or_default().extend(sids);
+            }
         }
-        // Just poll default backend for now
-        let _backend = self.get_backend(self.default_backend);
-        // Would need to track active sessions
+        for (kind, sids) in by_kind {
+            let backend = self.get_backend(kind);
+            for sid in sids {
+                if let Ok(events) = backend.poll_events(sid) {
+                    all_events.extend(events);
+                }
+            }
+        }
         Ok(all_events)
     }
 
     pub fn tick_session(&mut self, session: SessionId) -> Result<Vec<SessionEvent>> {
-        // Try all backends to find the one managing this session
-        for backend in self.backends.values_mut() {
-            match backend.poll_events(session) {
-                Ok(events) if !events.is_empty() => return Ok(events),
-                Ok(_) => continue,
-                Err(_) => continue,
-            }
-        }
-        Ok(vec![])
+        let kind = self.session_owners.get(&session).copied()
+            .unwrap_or(self.default_backend);
+        let backend = self.get_backend(kind);
+        backend.poll_events(session).map_err(|e| anyhow!("{}", e))
     }
 
     pub fn switch_backend(&mut self, kind: BackendKind) -> Result<()> {

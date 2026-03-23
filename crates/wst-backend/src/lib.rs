@@ -5,6 +5,35 @@ use std::process::{Child, Command, Stdio};
 use thiserror::Error;
 use wst_protocol::{BackendKind, ExecRequest, OutputChunk, SessionEvent, SessionId, TaskId, TaskStatus};
 
+/// Decode a byte slice using the system OEM code page (e.g. Big5/950 on Traditional Chinese Windows).
+/// Falls back to UTF-8 lossy if the code page is unknown.
+fn decode_oem_line(bytes: &[u8]) -> String {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Globalization::GetOEMCP;
+        let cp = unsafe { GetOEMCP() };
+        let encoding = match cp {
+            950 => encoding_rs::BIG5,
+            936 | 54936 => encoding_rs::GBK,
+            932 => encoding_rs::SHIFT_JIS,
+            949 => encoding_rs::EUC_KR,
+            _ => {
+                return String::from_utf8_lossy(bytes)
+                    .trim_end_matches(|c: char| c == '\r' || c == '\n')
+                    .to_string();
+            }
+        };
+        let (decoded, _enc, _had_errors) = encoding.decode(bytes);
+        decoded.trim_end_matches(|c: char| c == '\r' || c == '\n').to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        String::from_utf8_lossy(bytes)
+            .trim_end_matches(|c: char| c == '\r' || c == '\n')
+            .to_string()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum BackendError {
     #[error("backend io error: {0}")]
@@ -21,6 +50,7 @@ pub trait Backend: Send {
     fn interrupt(&mut self, session: SessionId, task: TaskId) -> Result<(), BackendError>;
     fn poll_events(&mut self, session: SessionId) -> Result<Vec<SessionEvent>, BackendError>;
     fn reset(&mut self);
+    fn active_session_ids(&self) -> Vec<SessionId>;
 }
 
 struct Task {
@@ -59,6 +89,10 @@ impl Backend for CmdBackend {
         BackendKind::Cmd
     }
 
+    fn active_session_ids(&self) -> Vec<SessionId> {
+        self.sessions.keys().cloned().collect()
+    }
+
     fn spawn_session(&mut self) -> Result<SessionId, BackendError> {
         let id = self.next_session;
         self.next_session += 1;
@@ -71,15 +105,8 @@ impl Backend for CmdBackend {
         self.next_task += 1;
 
 
-        // Use PowerShell with UTF-8 encoding to execute cmd commands
-        // This properly captures cmd.exe output including built-in commands like dir
-        let ps_command = format!(
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; cmd /C {}",
-            req.command_line.replace("\"", "`\"")
-        );
-
-        let mut child = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_command])
+        let mut child = Command::new("cmd")
+            .args(["/C", &req.command_line])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -125,10 +152,9 @@ impl Backend for CmdBackend {
                 // This prevents buffer deadlock and shows output immediately
                 if let Some(ref mut reader) = task.stdout_reader {
                     use std::io::BufRead;
-                    let mut buf = String::new();
-                    while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-                        // Trim both trailing whitespace and any carriage returns
-                        let line = buf.trim_end().trim_end_matches('\r').to_string();
+                    let mut buf = Vec::new();
+                    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
+                        let line = decode_oem_line(&buf);
                         task.output_buffer.push(line.clone());
                         result.push(SessionEvent::Output(OutputChunk {
                             task_id: task_id,
@@ -140,10 +166,9 @@ impl Backend for CmdBackend {
                 }
                 if let Some(ref mut reader) = task.stderr_reader {
                     use std::io::BufRead;
-                    let mut buf = String::new();
-                    while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-                        // Trim both trailing whitespace and any carriage returns
-                        let line = buf.trim_end().trim_end_matches('\r').to_string();
+                    let mut buf = Vec::new();
+                    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
+                        let line = decode_oem_line(&buf);
                         task.error_buffer.push(line.clone());
                         result.push(SessionEvent::Output(OutputChunk {
                             task_id: task_id,
@@ -258,6 +283,10 @@ impl Backend for PwshBackend {
         BackendKind::Pwsh
     }
 
+    fn active_session_ids(&self) -> Vec<SessionId> {
+        self.sessions.keys().cloned().collect()
+    }
+
     fn spawn_session(&mut self) -> Result<SessionId, BackendError> {
         let id = self.next_session;
         self.next_session += 1;
@@ -269,14 +298,8 @@ impl Backend for PwshBackend {
         let task_id = self.next_task;
         self.next_task += 1;
 
-        // Set output encoding to UTF-8 before executing command
-        let ps_command = format!(
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; {}",
-            req.command_line
-        );
-
         let mut child = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_command])
+            .args(["-NoProfile", "-NonInteractive", "-Command", &req.command_line])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -321,9 +344,9 @@ impl Backend for PwshBackend {
                 // First, read all available output from stdout/stderr
                 if let Some(ref mut reader) = task.stdout_reader {
                     use std::io::BufRead;
-                    let mut buf = String::new();
-                    while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-                        let line = buf.trim_end().trim_end_matches('\r').to_string();
+                    let mut buf = Vec::new();
+                    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
+                        let line = decode_oem_line(&buf);
                         task.output_buffer.push(line.clone());
                         result.push(SessionEvent::Output(OutputChunk {
                             task_id: task_id,
@@ -335,9 +358,9 @@ impl Backend for PwshBackend {
                 }
                 if let Some(ref mut reader) = task.stderr_reader {
                     use std::io::BufRead;
-                    let mut buf = String::new();
-                    while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-                        let line = buf.trim_end().trim_end_matches('\r').to_string();
+                    let mut buf = Vec::new();
+                    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
+                        let line = decode_oem_line(&buf);
                         task.error_buffer.push(line.clone());
                         result.push(SessionEvent::Output(OutputChunk {
                             task_id: task_id,
@@ -439,6 +462,10 @@ impl Backend for CygctlBackend {
         BackendKind::Cygctl
     }
 
+    fn active_session_ids(&self) -> Vec<SessionId> {
+        self.sessions.keys().cloned().collect()
+    }
+
     fn spawn_session(&mut self) -> Result<SessionId, BackendError> {
         let id = self.next_session;
         self.next_session += 1;
@@ -516,9 +543,9 @@ impl Backend for CygctlBackend {
                 // First, read all available output from stdout/stderr (real-time)
                 if let Some(ref mut reader) = task.stdout_reader {
                     use std::io::BufRead;
-                    let mut buf = String::new();
-                    while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-                        let line = buf.trim_end().trim_end_matches('\r').to_string();
+                    let mut buf = Vec::new();
+                    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
+                        let line = decode_oem_line(&buf);
                         task.output_buffer.push(line.clone());
                         result.push(SessionEvent::Output(OutputChunk {
                             task_id: task_id,
@@ -530,9 +557,9 @@ impl Backend for CygctlBackend {
                 }
                 if let Some(ref mut reader) = task.stderr_reader {
                     use std::io::BufRead;
-                    let mut buf = String::new();
-                    while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-                        let line = buf.trim_end().trim_end_matches('\r').to_string();
+                    let mut buf = Vec::new();
+                    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
+                        let line = decode_oem_line(&buf);
                         task.error_buffer.push(line.clone());
                         result.push(SessionEvent::Output(OutputChunk {
                             task_id: task_id,
