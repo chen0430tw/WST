@@ -195,6 +195,10 @@ struct AppState {
     current_task_id: Option<u64>,
     command_in_progress: bool,
     current_dir: String,
+    home_dir: String,
+    hostname: String,
+    username: String,
+    prompt_char: String,
     debug_mode: bool,
     // Debug stats
     lines_received: usize,
@@ -215,13 +219,47 @@ impl AppState {
             .unwrap_or(&current_dir)
             .to_string();
 
+        let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows".to_string()).to_lowercase();
+        let username = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string()).to_lowercase();
+        let home_dir = std::env::var("USERPROFILE").unwrap_or_else(|_| current_dir.clone());
+        let current_dir = home_dir.clone();
+
+        // Check if running as admin (for # vs $ prompt)
+        #[cfg(windows)]
+        let is_admin = {
+            use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+            use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+            use windows::Win32::Foundation::HANDLE;
+            unsafe {
+                let mut token = HANDLE::default();
+                let mut elevated = false;
+                if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_ok() {
+                    let mut elevation = TOKEN_ELEVATION::default();
+                    let mut size = std::mem::size_of::<TOKEN_ELEVATION>() as u32;
+                    if GetTokenInformation(token, TokenElevation,
+                        Some(&mut elevation as *mut _ as *mut _), size, &mut size).is_ok() {
+                        elevated = elevation.TokenIsElevated != 0;
+                    }
+                    let _ = windows::Win32::Foundation::CloseHandle(token);
+                }
+                elevated
+            }
+        };
+        #[cfg(not(windows))]
+        let is_admin = false;
+
+        let prompt_char = if is_admin { "#" } else { "$" };
+
         Self {
             core,
             input: String::new(),
             cursor_position: 0,
             output: vec![
-                OutputLine::system(format!("WST v{} - Windows Subsystem for TTY", VERSION)),
-                OutputLine::normal("Type :help for available commands"),
+                OutputLine::normal(format!("WST v{} {} tty1", VERSION, hostname)),
+                OutputLine::normal(""),
+                OutputLine::normal(format!("{} login: {}", hostname, username)),
+                OutputLine::normal(""),
+                OutputLine::normal(format!("Welcome to WST v{} (Windows Subsystem for TTY)", VERSION)),
                 OutputLine::normal(""),
             ],
             running: true,
@@ -230,6 +268,10 @@ impl AppState {
             current_task_id: None,
             command_in_progress: false,
             current_dir,
+            home_dir,
+            hostname,
+            username,
+            prompt_char: prompt_char.to_string(),
             debug_mode: false,
             lines_received: 0,
             last_command: String::new(),
@@ -368,7 +410,12 @@ impl AppState {
             return;
         }
 
-        self.output.push(OutputLine::normal(format!("{}> {}", self.current_dir, command)));
+        // Echo command with ANSI colors so history scrollback looks like the live prompt
+        let echoed = format!(
+            "\x1b[32m{}@{}\x1b[0m:\x1b[36m{}\x1b[0m{} {}",
+            self.username, self.hostname, self.display_dir(), self.prompt_char, command
+        );
+        self.output.push(OutputLine::normal(echoed));
         self.scroll_to_bottom();
 
         // Track command and reset stats
@@ -509,6 +556,14 @@ impl AppState {
         }
     }
 
+    fn display_dir(&self) -> &str {
+        if self.current_dir.eq_ignore_ascii_case(&self.home_dir) {
+            "~"
+        } else {
+            &self.current_dir
+        }
+    }
+
     fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
@@ -523,54 +578,8 @@ impl AppState {
 fn draw_ui(f: &mut Frame, state: &mut AppState) {
     let size = f.size();
 
-    // Layout: status bar (top) | main content (output + input)
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // Status bar at top
-            Constraint::Min(1),    // Main content
-        ])
-        .split(size);
-
-    // Draw status bar at top
-    let backend_name = if let Ok(core) = state.core.try_lock() {
-        format!("{:?}", core.default_backend())
-    } else {
-        "Unknown".to_string()
-    };
-
-    let mut status_line = vec![
-        Span::styled(" WST v", Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::styled(VERSION, Style::default().fg(Color::Black).bg(Color::Cyan)),
-        Span::styled(" | ", Style::default().fg(Color::Cyan).bg(Color::Black)),
-        Span::styled(
-            format!("{} ", backend_name),
-            Style::default().fg(Color::Green).bg(Color::Black),
-        ),
-    ];
-
-    // Show DEBUG indicator when debug mode is on
-    if state.debug_mode {
-        status_line.push(Span::styled(
-            "DEBUG ",
-            Style::default().fg(Color::Red).bg(Color::Black),
-        ));
-    }
-
-    status_line.push(Span::styled(
-        format!("Sess:{:?} Hist:{} ",
-            state.session_id,
-            if let Ok(core) = state.core.try_lock() { core.history().len() } else { 0 }
-        ),
-        Style::default().fg(Color::DarkGray).bg(Color::Black),
-    ));
-
-    let status_paragraph = Paragraph::new(Line::from(status_line))
-        .style(Style::default().bg(Color::Rgb(20, 20, 30)));
-    f.render_widget(status_paragraph, chunks[0]);
-
-    // Draw output + input in main area
-    let area = chunks[1];
+    // Full area — pure TTY style, no status bar
+    let area = size;
 
     let reserved = if state.debug_mode { 2u16 } else { 1u16 };
     let output_rows = area.height.saturating_sub(reserved);
@@ -604,17 +613,19 @@ fn draw_ui(f: &mut Frame, state: &mut AppState) {
             }
         }
     }
+    let actual_output_lines = output_lines.len() as u16;
+
     let output_para = Paragraph::new(output_lines);
     let output_area = ratatui::layout::Rect {
         x: area.x,
         y: area.y,
         width: area.width,
-        height: output_rows,
+        height: actual_output_lines.min(output_rows),
     };
     f.render_widget(output_para, output_area);
 
-    // y = area.y + output_rows is the first row after output
-    let y = area.y + output_rows;
+    // y = area.y + actual lines rendered, clamped so input stays on screen
+    let y = (area.y + actual_output_lines).min(area.y + output_rows);
 
     // Acquire buffer for debug/input rendering (after output widget render)
     let buf = f.buffer_mut();
@@ -654,7 +665,7 @@ fn draw_ui(f: &mut Frame, state: &mut AppState) {
         }
     }
 
-    // Input prompt at the last line
+    // Input prompt at the last line — colored like bash PS1
     let cursor_pos = state.cursor_position.min(state.input.len());
     let before_cursor = &state.input[..cursor_pos];
     let after_cursor = if cursor_pos < state.input.len() {
@@ -663,19 +674,29 @@ fn draw_ui(f: &mut Frame, state: &mut AppState) {
         ""
     };
 
-    let prompt_text = format!("{}>", state.current_dir);
-    let input_line = format!("{}{}{}", prompt_text, before_cursor, after_cursor);
+    // Prompt segments: [user@host] [:] [path] [$] [input]
+    let user_host = format!("{}@{}", state.username, state.hostname);
+    let path_part = state.display_dir().to_string();
+    let suffix = format!("{} ", state.prompt_char);
+    let prompt_text = format!("{}:{}{}", user_host, path_part, suffix);
 
-    // Write input line
+    // Write colored prompt + input char-by-char
     let mut col = area.x;
-    for ch in input_line.chars() {
-        if col < area.x + area.width {
-            buf.get_mut(col, input_y)
-                .set_char(ch)
-                .set_style(Style::default().fg(Color::White));
-            col += ch.width().unwrap_or(1) as u16;
+    let write_str = |buf: &mut ratatui::buffer::Buffer, col: &mut u16, s: &str, style: Style| {
+        for ch in s.chars() {
+            if *col < area.x + area.width {
+                buf.get_mut(*col, input_y).set_char(ch).set_style(style);
+                *col += ch.width().unwrap_or(1) as u16;
+            }
         }
-    }
+    };
+
+    write_str(buf, &mut col, &user_host, Style::default().fg(Color::Green));
+    write_str(buf, &mut col, ":", Style::default().fg(Color::White));
+    write_str(buf, &mut col, &path_part, Style::default().fg(Color::Cyan));
+    write_str(buf, &mut col, &suffix, Style::default().fg(Color::White));
+    write_str(buf, &mut col, before_cursor, Style::default().fg(Color::White));
+    write_str(buf, &mut col, after_cursor, Style::default().fg(Color::White));
 
     // Set cursor position
     let prompt_width: u16 = prompt_text.chars().map(|c: char| c.width().unwrap_or(1) as u16).sum();
