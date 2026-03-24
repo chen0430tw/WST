@@ -112,21 +112,29 @@ pub async fn run_hotkey_listener(
 
                         if visible {
                             // Show/launch UI
-                            launch_or_focus_ui(&mut ui_pid).await?;
+                            if let Err(e) = launch_or_focus_ui(&mut ui_pid).await {
+                                tracing::error!("launch_or_focus_ui failed: {}", e);
+                            }
                         } else {
                             // Hide UI (close it)
-                            close_ui(&mut ui_pid).await?;
+                            if let Err(e) = close_ui(&mut ui_pid).await {
+                                tracing::error!("close_ui failed: {}", e);
+                            }
                         }
                     }
                     HotkeyEvent::ShowFrontend => {
                         state.set_frontend_visible(true).await;
                         tracing::info!("Hotkey: Frontend shown");
-                        launch_or_focus_ui(&mut ui_pid).await?;
+                        if let Err(e) = launch_or_focus_ui(&mut ui_pid).await {
+                            tracing::error!("launch_or_focus_ui failed: {}", e);
+                        }
                     }
                     HotkeyEvent::HideFrontend => {
                         state.set_frontend_visible(false).await;
                         tracing::info!("Hotkey: Frontend hidden");
-                        close_ui(&mut ui_pid).await?;
+                        if let Err(e) = close_ui(&mut ui_pid).await {
+                            tracing::error!("close_ui failed: {}", e);
+                        }
                     }
                     HotkeyEvent::Custom(id) => {
                         tracing::debug!("Hotkey: Custom event {}", id);
@@ -158,8 +166,14 @@ async fn launch_or_focus_ui(ui_pid: &mut Option<u32>) -> Result<()> {
         tracing::info!("Checking existing UI process with PID: {}", pid);
         if is_pid_alive(pid) {
             tracing::info!("UI process still running, re-showing window");
-            show_ui_window(false)?;
-            return Ok(());
+            match show_ui_window(false) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    // HWND is stale (user closed the UI from inside), relaunch
+                    tracing::warn!("show_ui_window failed ({}), relaunching UI", e);
+                    *ui_pid = None;
+                }
+            }
         } else {
             tracing::info!("UI process {} has exited, will relaunch", pid);
             *ui_pid = None;

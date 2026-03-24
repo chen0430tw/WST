@@ -92,6 +92,10 @@ async fn main() -> Result<()> {
             WstConfig::default()
         });
 
+    let hotkey_str = config.hotkey_global.as_deref()
+        .unwrap_or(&config.hotkey)
+        .to_string();
+
     // Check if already running
     if let Ok(true) = wst_daemon::lifecycle::check_singleton() {
         eprintln!("WST daemon is already running");
@@ -105,7 +109,7 @@ async fn main() -> Result<()> {
     println!();
     println!("========================================");
     println!("WST Daemon starting...");
-    println!("Global hotkey: Ctrl+Alt+F12");
+    println!("Global hotkey: {}", hotkey_str);
     println!("========================================");
     println!();
 
