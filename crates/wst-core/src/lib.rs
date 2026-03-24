@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::collections::VecDeque;
-use wst_backend::{Backend, CmdBackend, CygctlBackend, PwshBackend};
+use wst_backend::{Backend, CmdBackend, ConPtyBackend, CygctlBackend, PwshBackend};
 use wst_config::WstConfig;
 use wst_protocol::{BackendKind, ExecRequest, SessionEvent, SessionId, TaskId};
 
@@ -209,6 +209,7 @@ impl BackendManager {
         backends.insert(BackendKind::Cmd, Box::new(CmdBackend::new()));
         backends.insert(BackendKind::Pwsh, Box::new(PwshBackend::new()));
         backends.insert(BackendKind::Cygctl, Box::new(CygctlBackend::new(&config.cygctl_path)));
+        backends.insert(BackendKind::ConPty, Box::new(ConPtyBackend::new("cmd.exe")));
 
         Self {
             backends,
@@ -228,6 +229,7 @@ impl BackendManager {
                 BackendKind::Cmd => Box::new(CmdBackend::new()),
                 BackendKind::Pwsh => Box::new(PwshBackend::new()),
                 BackendKind::Cygctl => Box::new(CygctlBackend::new("cygctl")),
+                BackendKind::ConPty => Box::new(ConPtyBackend::new("cmd.exe")),
             };
             self.backends.insert(kind, backend);
         }

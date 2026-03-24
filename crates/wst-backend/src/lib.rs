@@ -1,3 +1,6 @@
+pub mod conpty;
+pub use conpty::ConPtyBackend;
+
 use std::collections::HashMap;
 use std::io::BufReader;
 use std::process::{Child, Command, Stdio};

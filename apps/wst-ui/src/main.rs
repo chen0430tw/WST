@@ -1,5 +1,6 @@
 mod builtin;
 
+use ansi_to_tui::IntoText;
 use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 use crossterm::{
@@ -205,8 +206,13 @@ impl AppState {
     fn new(config: WstConfig) -> Self {
         let core = Arc::new(tokio::sync::Mutex::new(WstCore::new(config)));
         let current_dir = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("C:\\Users\\Administrator"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("C:\\Users"))
             .to_string_lossy()
+            .to_string();
+        // Strip Windows NT namespace prefix that appears in some launch contexts
+        let current_dir = current_dir
+            .strip_prefix("\\\\?\\")
+            .unwrap_or(&current_dir)
             .to_string();
 
         Self {
@@ -275,9 +281,39 @@ impl AppState {
             KeyCode::Right => self.move_cursor_right(),
             KeyCode::Home => self.cursor_position = 0,
             KeyCode::End => self.cursor_position = self.input.len(),
-            // Up/Down now scroll output (WT converts mouse wheel to these keys)
-            KeyCode::Up => self.scroll_output_up(3),
-            KeyCode::Down => self.scroll_output_down(3),
+            KeyCode::Up => {
+                if self.scroll_offset == 0 {
+                    // At bottom → cycle history backwards
+                    if let Ok(mut core) = self.core.try_lock() {
+                        if let Some(cmd) = core.history_prev() {
+                            self.input = cmd;
+                            self.cursor_position = self.input.len();
+                        }
+                    }
+                } else {
+                    self.scroll_output_up(3);
+                }
+            }
+            KeyCode::Down => {
+                if self.scroll_offset == 0 {
+                    // At bottom → cycle history forwards
+                    if let Ok(mut core) = self.core.try_lock() {
+                        match core.history_next() {
+                            Some(cmd) => {
+                                self.input = cmd;
+                                self.cursor_position = self.input.len();
+                            }
+                            None => {
+                                self.input.clear();
+                                self.cursor_position = 0;
+                                core.history_reset();
+                            }
+                        }
+                    }
+                } else {
+                    self.scroll_output_down(3);
+                }
+            }
             KeyCode::Esc => {
                 self.input.clear();
                 self.cursor_position = 0;
@@ -444,6 +480,7 @@ impl AppState {
                                         BackendKind::Pwsh => self.backend_encoding = "Big5/UTF-16".to_string(),
                                         BackendKind::Cmd => self.backend_encoding = "CP936/GBK".to_string(),
                                         BackendKind::Cygctl => self.backend_encoding = "UTF-8".to_string(),
+                                        BackendKind::ConPty => self.backend_encoding = "UTF-8/ANSI".to_string(),
                                     }
                                 }
                                 Err(e) => {
@@ -534,9 +571,7 @@ fn draw_ui(f: &mut Frame, state: &mut AppState) {
 
     // Draw output + input in main area
     let area = chunks[1];
-    let buf = f.buffer_mut();
 
-    let text_width = area.width;
     let reserved = if state.debug_mode { 2u16 } else { 1u16 };
     let output_rows = area.height.saturating_sub(reserved);
 
@@ -550,33 +585,39 @@ fn draw_ui(f: &mut Frame, state: &mut AppState) {
         (output_len - visible_count - offset, visible_count)
     };
 
-    // Render output lines; y tracks the next free row after output
-    let output_area_bottom = area.y + output_rows.saturating_sub(1);
-    let text_right = area.x + text_width;
-    let mut y = area.y;
+    // Build ratatui Lines from output, parsing ANSI escape sequences for color
+    let mut output_lines: Vec<ratatui::text::Line<'static>> = Vec::new();
     for line in state.output.iter().skip(start).take(count) {
-        if y > output_area_bottom {
-            break;
-        }
-        let style = if line.is_error {
-            Style::default().fg(Color::Red)
-        } else if line.is_system {
-            Style::default().fg(Color::Cyan)
+        if line.is_system {
+            output_lines.push(ratatui::text::Line::from(
+                Span::styled(line.text.clone(), Style::default().fg(Color::Cyan)),
+            ));
+        } else if line.is_error {
+            output_lines.push(ratatui::text::Line::from(
+                Span::styled(line.text.clone(), Style::default().fg(Color::Red)),
+            ));
         } else {
-            Style::default().fg(Color::Reset)
-        };
-        let text = line.text.replace('\t', "        ");
-        let mut col = area.x;
-        for ch in text.chars() {
-            let w = ch.width().unwrap_or(1) as u16;
-            if col + w > text_right {
-                break;
+            // Parse ANSI escape sequences for color
+            match line.text.as_str().into_text() {
+                Ok(text) => output_lines.extend(text.lines),
+                Err(_) => output_lines.push(ratatui::text::Line::from(line.text.clone())),
             }
-            buf.get_mut(col, y).set_char(ch).set_style(style);
-            col += w;
         }
-        y += 1;
     }
+    let output_para = Paragraph::new(output_lines);
+    let output_area = ratatui::layout::Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: output_rows,
+    };
+    f.render_widget(output_para, output_area);
+
+    // y = area.y + output_rows is the first row after output
+    let y = area.y + output_rows;
+
+    // Acquire buffer for debug/input rendering (after output widget render)
+    let buf = f.buffer_mut();
 
     // Place debug and input right after last output line (clamped to area bounds)
     let (debug_y, input_y) = if state.debug_mode {

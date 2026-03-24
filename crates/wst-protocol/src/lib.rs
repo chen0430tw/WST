@@ -8,6 +8,7 @@ pub enum BackendKind {
     Cygctl,
     Pwsh,
     Cmd,
+    ConPty,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
