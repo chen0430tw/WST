@@ -442,12 +442,22 @@ fn kill_ui_pid(_pid: u32) {}
 
 /// Find the wst-ui executable (prefer debug builds during development)
 fn find_wst_ui_executable() -> String {
-    let paths = vec![
-        // Debug builds first
+    // First priority: wst-ui.exe sitting next to the daemon executable.
+    // This works regardless of the working directory.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("wst-ui.exe");
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    // Fallback: relative paths for in-tree development (cargo run from repo root)
+    let paths = [
         "target/debug/wst-ui.exe",
         "../target/debug/wst-ui.exe",
         "../../target/debug/wst-ui.exe",
-        // Release builds fallback
         "target/release/wst-ui.exe",
         "../target/release/wst-ui.exe",
         "../../target/release/wst-ui.exe",
@@ -460,7 +470,11 @@ fn find_wst_ui_executable() -> String {
         }
     }
 
-    "target/debug/wst-ui.exe".to_string()
+    // Last resort: same directory as daemon (absolute, will fail gracefully)
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("wst-ui.exe").to_string_lossy().to_string()))
+        .unwrap_or_else(|| "wst-ui.exe".to_string())
 }
 
 /// Start the hotkey manager in a background thread using win-hotkeys
@@ -523,7 +537,7 @@ pub fn start_hotkey_thread(
             Ok(id) => {
                 tracing::info!("Hotkey registered successfully!");
                 tracing::info!("Hotkey ID: {:?}", id);
-                tracing::info!("Press Ctrl+Alt+F12 to toggle WST UI...");
+                tracing::info!("Press hotkey to toggle WST UI...");
             }
             Err(e) => {
                 tracing::error!("Failed to register hotkey: {}", e);

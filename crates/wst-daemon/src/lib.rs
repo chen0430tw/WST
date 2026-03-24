@@ -104,10 +104,11 @@ impl WstDaemon {
         let (hotkey_tx, hotkey_rx) = mpsc::channel(HOTKEY_CHANNEL_CAPACITY);
 
         // Start global hotkey listener in background thread
-        let hotkey_config = match &self.state.config.hotkey_global {
-            Some(s) => hotkey::HotkeyConfig::parse(s).unwrap_or_else(|_| hotkey::HotkeyConfig::default_wst_hotkey()),
-            None => hotkey::HotkeyConfig::default_wst_hotkey(),
-        };
+        // hotkey_global takes priority; fall back to hotkey, then built-in default.
+        let hotkey_str = self.state.config.hotkey_global.as_deref()
+            .unwrap_or(&self.state.config.hotkey);
+        let hotkey_config = hotkey::HotkeyConfig::parse(hotkey_str)
+            .unwrap_or_else(|_| hotkey::HotkeyConfig::default_wst_hotkey());
 
         let _hotkey_handle = hotkey::start_hotkey_thread(hotkey_config, hotkey_tx)?;
 
@@ -133,7 +134,7 @@ impl WstDaemon {
         });
 
         tracing::info!("WST Daemon running (press Ctrl+C to stop)");
-        tracing::info!("Global hotkey: Ctrl+Alt+F12 (configurable)");
+        tracing::info!("Global hotkey: {} (configurable)", hotkey_str);
 
         // Wait for shutdown signal
         tokio::select! {

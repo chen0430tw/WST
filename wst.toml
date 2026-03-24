@@ -2,4 +2,4 @@ default_backend = "Cmd"
 cygctl_path = "cygctl"
 fullscreen = true
 alternate_screen = true
-hotkey = "Ctrl+Alt+Space"
+hotkey = "Ctrl+Alt+F3"

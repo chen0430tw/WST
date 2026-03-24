@@ -37,14 +37,14 @@ impl Default for WstConfig {
             cygctl_path: "./cygctl.exe".to_string(),
             fullscreen: true,
             alternate_screen: true,
-            hotkey: "Ctrl+Alt+F12".to_string(),
+            hotkey: "Ctrl+Alt+F3".to_string(),
 
             // Second stage defaults
             daemon_autostart: Some(true),
             daemon_persist_backend: Some(true),
             daemon_max_sessions: Some(10),
             daemon_snapshot_interval: Some(300),
-            hotkey_global: Some("Ctrl+Alt+F12".to_string()),
+            hotkey_global: Some("Ctrl+Alt+F3".to_string()),
             session_restore_on_startup: Some(true),
         }
     }
@@ -52,12 +52,21 @@ impl Default for WstConfig {
 
 impl WstConfig {
     pub fn load_default() -> Result<Self> {
-        let path = Path::new("wst.toml");
+        // Prefer wst.toml next to the executable so the binary can be launched
+        // from any working directory and still find its config.
+        let exe_sibling = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("wst.toml")));
+
+        let path = exe_sibling
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| Path::new("wst.toml").to_path_buf());
+
         if !path.exists() {
             return Ok(Self::default());
         }
 
-        let text = fs::read_to_string(path)?;
+        let text = fs::read_to_string(&path)?;
         let cfg: Self = toml::from_str(&text)?;
         Ok(cfg)
     }
