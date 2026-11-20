@@ -374,13 +374,53 @@ async fn close_ui(ui_pid: &mut Option<u32>) -> Result<()> {
     Ok(())
 }
 
+/// Force `hwnd` to the top of the Z-order and give it keyboard focus, working
+/// around the Windows foreground lock. `SetForegroundWindow` from a background
+/// process (the daemon) is silently denied after the first few calls, so the
+/// window would `SW_SHOW` but stay hidden behind the current foreground window
+/// (the "shows for the first ~5 toggles then nothing" symptom). Z-order changes
+/// via `SetWindowPos` are NOT subject to that lock, and briefly attaching to the
+/// foreground thread's input queue lets `SetForegroundWindow` succeed
+/// legitimately (the standard, non-destructive workaround — we detach right
+/// after, so focus return is left intact).
+#[cfg(windows)]
+unsafe fn bring_to_foreground(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetForegroundWindow, SetWindowPos, GetForegroundWindow, GetWindowThreadProcessId,
+        HWND_TOPMOST, HWND_NOTOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    };
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::Foundation::BOOL;
+
+    // 1) Raise to the top of the Z-order (not restricted by the foreground
+    //    lock), then drop back to non-topmost so it is not permanently
+    //    always-on-top. This alone guarantees the window is visible.
+    let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE);
+
+    // 2) Grab keyboard focus by briefly sharing the current foreground thread's
+    //    input queue, then detaching immediately.
+    let fg = GetForegroundWindow();
+    let fg_thread = GetWindowThreadProcessId(fg, None);
+    let cur_thread = GetCurrentThreadId();
+    if fg_thread != 0 && fg_thread != cur_thread {
+        let _ = AttachThreadInput(cur_thread, fg_thread, BOOL(1));
+        let _ = SetForegroundWindow(hwnd);
+        let _ = AttachThreadInput(cur_thread, fg_thread, BOOL(0));
+    } else {
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
 /// Show the WST UI window using Windows API.
 /// `first_show`: true when window is freshly launched (needs fullscreen setup),
 ///               false when re-showing a previously hidden window (already fullscreen).
 #[cfg(windows)]
 fn show_ui_window(first_show: bool) -> Result<()> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        ShowWindow, SetForegroundWindow, IsWindow, BringWindowToTop,
+        ShowWindow, IsWindow,
         SetWindowPos, SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE, SW_SHOW,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -416,8 +456,7 @@ fn show_ui_window(first_show: bool) -> Result<()> {
             let _ = SetWindowPos(hwnd, None, -32000, -32000, 0, 0,
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = BringWindowToTop(hwnd);
-            let _ = SetForegroundWindow(hwnd);
+            bring_to_foreground(hwnd);
 
             thread::sleep(Duration::from_millis(300));
 
@@ -436,10 +475,10 @@ fn show_ui_window(first_show: bool) -> Result<()> {
             keybd_event(VK_MENU.0 as u8, 0x38, KEYEVENTF_KEYUP, 0);
         } else {
             // Re-show: window was hidden while already fullscreen (SW_HIDE preserves state).
-            // Just show it — it comes back fullscreen directly.
+            // Force it to the top of the Z-order and grab focus despite the
+            // Windows foreground lock (see bring_to_foreground).
             let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = BringWindowToTop(hwnd);
-            let _ = SetForegroundWindow(hwnd);
+            bring_to_foreground(hwnd);
         }
     }
 
