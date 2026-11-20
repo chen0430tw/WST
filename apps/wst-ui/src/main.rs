@@ -879,6 +879,23 @@ impl AppState {
         self.scroll_to_bottom();
         self.needs_redraw = true;
     }
+
+    /// tty-style Ctrl+C: echo the current prompt + aborted input with a trailing
+    /// `^C` (mirrors the command-echo in execute_command, which renders), drop
+    /// any pending input and clear the in-progress marker, returning to a fresh
+    /// prompt. Does NOT close the terminal. The child, if any, still finishes in
+    /// the background and its output is still shown.
+    fn interrupt_line(&mut self) {
+        let echoed = format!(
+            "\x1b[32m{}@{}\x1b[0m:\x1b[36m{}\x1b[0m{} {}^C",
+            self.username, self.hostname, self.display_dir(), self.prompt_char, self.input
+        );
+        self.add_output(OutputLine::normal(echoed));
+        self.command_in_progress = false;
+        self.current_task_id = None;
+        self.input.clear();
+        self.cursor_position = 0;
+    }
 }
 
 /// Visual rows a ratatui Line occupies at the given terminal width (accounting for wrap).
@@ -1121,6 +1138,13 @@ fn run_app(
     let tick_rate = Duration::from_millis(100);
 
     while state.running {
+        // Ctrl+C that arrived as a console control event (signal path) sets this
+        // from the handler thread; surface it as a tty-style line interrupt.
+        #[cfg(windows)]
+        if CTRL_C_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            state.interrupt_line();
+        }
+
         if state.needs_redraw {
             terminal.draw(|f| draw_ui(f, &mut state))?;
             state.needs_redraw = false;
@@ -1188,13 +1212,18 @@ fn run_app(
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
-                    match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            state.running = false;
-                        }
-                        _ => {
-                            state.handle_input(key);
-                        }
+                    // tty semantics: Ctrl+C interrupts the current line / running
+                    // command and returns to a fresh prompt showing `^C`; it does
+                    // NOT close the terminal. Terminals encode Ctrl+C either as
+                    // Char('c'/'C')+CONTROL or as the ETX control char '\u{3}',
+                    // so match both.
+                    let is_ctrl_c = (matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                        && key.modifiers.contains(KeyModifiers::CONTROL))
+                        || key.code == KeyCode::Char('\u{3}');
+                    if is_ctrl_c {
+                        state.interrupt_line();
+                    } else {
+                        state.handle_input(key);
                     }
                 }
                 _ => {}
@@ -1214,6 +1243,27 @@ fn init_utf8_console() -> Result<()> {
         .stderr(std::process::Stdio::null())
         .spawn();
     Ok(())
+}
+
+/// Set when the console delivers Ctrl+C / Ctrl+Break as a control event (the
+/// signal path). The main loop polls this and turns it into a line interrupt.
+#[cfg(windows)]
+static CTRL_C_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Console control handler: swallow Ctrl+C / Ctrl+Break so the OS does NOT
+/// terminate wst-ui (the "Ctrl+C closes the terminal" bug), recording the event
+/// for the main loop. All other control events (close/logoff/shutdown) fall
+/// through to default handling so the process can still be shut down normally.
+#[cfg(windows)]
+unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> windows::Win32::Foundation::BOOL {
+    use windows::Win32::System::Console::{CTRL_C_EVENT, CTRL_BREAK_EVENT};
+    use windows::Win32::Foundation::BOOL;
+    if ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT {
+        CTRL_C_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+        BOOL(1) // handled — do not terminate
+    } else {
+        BOOL(0) // not handled — run the default handler
+    }
 }
 
 fn main() -> Result<()> {
@@ -1260,6 +1310,27 @@ fn main() -> Result<()> {
     }
 
     enable_raw_mode()?;
+
+    // Stop the Windows console from killing wst-ui on Ctrl+C / Ctrl+Break:
+    // install a control handler that swallows them, and clear
+    // ENABLE_PROCESSED_INPUT so Ctrl+C is delivered as a key event (handled by
+    // AppState::interrupt_line to echo `^C` and return to a fresh prompt).
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Console::{
+            SetConsoleCtrlHandler, GetStdHandle, GetConsoleMode, SetConsoleMode,
+            STD_INPUT_HANDLE, ENABLE_PROCESSED_INPUT, CONSOLE_MODE,
+        };
+        use windows::Win32::Foundation::BOOL;
+        let _ = SetConsoleCtrlHandler(Some(console_ctrl_handler), BOOL(1));
+        if let Ok(h) = GetStdHandle(STD_INPUT_HANDLE) {
+            let mut mode = CONSOLE_MODE(0);
+            if GetConsoleMode(h, &mut mode).is_ok() {
+                let _ = SetConsoleMode(h, mode & !ENABLE_PROCESSED_INPUT);
+            }
+        }
+    }
+
     let mut stdout = io::stdout();
     if alternate_screen {
         execute!(stdout, EnterAlternateScreen)?;
