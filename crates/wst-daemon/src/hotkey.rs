@@ -167,18 +167,29 @@ pub async fn run_hotkey_listener(
             Some(event) = event_rx.recv() => {
                 match event {
                     HotkeyEvent::ToggleFrontend => {
-                        let visible = state.toggle_frontend().await;
-                        tracing::info!("Hotkey: Frontend toggled (now visible: {})", visible);
+                        // Decide show vs hide from the REAL window state, not a
+                        // stored bool. A blind bool flip desyncs the moment the
+                        // window's actual visibility diverges (a show that didn't
+                        // truly surface, the user alt-tabbing/closing it, a stale
+                        // PID) — after that every press is "backwards" and looks
+                        // like "按了没反应" (press does nothing). Reconciling here
+                        // makes each press do the right thing regardless.
+                        #[cfg(windows)]
+                        let actually_visible = ui_window_visible(&ui_pid);
+                        #[cfg(not(windows))]
+                        let actually_visible = state.is_frontend_visible().await;
 
-                        if visible {
-                            // Show/launch UI
-                            if let Err(e) = launch_or_focus_ui(&mut ui_pid).await {
-                                tracing::error!("launch_or_focus_ui failed: {}", e);
-                            }
-                        } else {
-                            // Hide UI (close it)
+                        if actually_visible {
+                            state.set_frontend_visible(false).await;
+                            tracing::info!("Hotkey: toggle -> hide (window was visible)");
                             if let Err(e) = close_ui(&mut ui_pid).await {
                                 tracing::error!("close_ui failed: {}", e);
+                            }
+                        } else {
+                            state.set_frontend_visible(true).await;
+                            tracing::info!("Hotkey: toggle -> show (window was hidden)");
+                            if let Err(e) = launch_or_focus_ui(&mut ui_pid).await {
+                                tracing::error!("launch_or_focus_ui failed: {}", e);
                             }
                         }
                     }
@@ -214,6 +225,32 @@ pub async fn run_hotkey_listener(
 
     tracing::info!("Hotkey listener stopped");
     Ok(())
+}
+
+/// Whether the wst-ui window is *actually* on screen right now: the tracked
+/// process is alive, its HWND is a valid window, and it is visible (not SW_HIDE).
+/// Used to reconcile the toggle against reality so presses never go "backwards".
+#[cfg(windows)]
+fn ui_window_visible(ui_pid: &Option<u32>) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{IsWindow, IsWindowVisible};
+
+    let pid = match ui_pid {
+        Some(p) => *p,
+        None => return false,
+    };
+    if !is_pid_alive(pid) {
+        return false;
+    }
+    let hwnd = match read_ui_hwnd() {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    unsafe {
+        if !IsWindow(hwnd).as_bool() {
+            return false;
+        }
+        IsWindowVisible(hwnd).as_bool()
+    }
 }
 
 /// Launch or focus the WST UI

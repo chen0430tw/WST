@@ -614,6 +614,32 @@ impl AppState {
             return;
         }
 
+        // `cd` is a shell builtin, not an executable. Handle it in WST so it
+        // actually changes the working directory: each backend command runs in
+        // a fresh child that inherits this process's cwd, and dispatching `cd`
+        // to the backend would either fail ("exec: cd: not found" in root mode)
+        // or change only the throwaway child's directory.
+        {
+            let t = command.trim_start();
+            let after_cd = t.strip_prefix("cd");
+            let is_cd = match after_cd {
+                Some(rest) => {
+                    rest.is_empty()
+                        || rest.starts_with(|c: char| {
+                            c.is_whitespace() || c == '.' || c == '\\' || c == '/' || c == '~'
+                        })
+                }
+                None => false,
+            };
+            if is_cd {
+                let arg = after_cd.unwrap().trim();
+                self.change_dir(arg);
+                self.input.clear();
+                self.cursor_position = 0;
+                return;
+            }
+        }
+
         if command.starts_with(':') {
             self.handle_builtin(&command);
         } else {
@@ -870,6 +896,56 @@ impl AppState {
             "~"
         } else {
             &self.current_dir
+        }
+    }
+
+    /// Change the working directory (the `cd` builtin). Resolves `arg` against
+    /// the current dir / home, validates it, updates `current_dir`, and sets the
+    /// process cwd so subsequent backend commands inherit it.
+    fn change_dir(&mut self, arg: &str) {
+        use std::path::{Path, PathBuf};
+
+        let arg = arg.trim();
+        // Strip optional surrounding quotes (e.g. `cd "C:\Program Files"`).
+        let arg = arg.trim_matches('"');
+
+        let target: PathBuf = if arg.is_empty() || arg == "~" {
+            PathBuf::from(&self.home_dir)
+        } else if let Some(rest) = arg.strip_prefix("~/").or_else(|| arg.strip_prefix("~\\")) {
+            Path::new(&self.home_dir).join(rest)
+        } else {
+            let p = Path::new(arg);
+            // Bare drive letter like `D:` means the root of that drive here.
+            if arg.len() == 2 && arg.as_bytes()[1] == b':' {
+                PathBuf::from(format!("{}\\", arg))
+            } else if p.is_absolute() || (arg.len() >= 2 && arg.as_bytes()[1] == b':') {
+                p.to_path_buf()
+            } else {
+                Path::new(&self.current_dir).join(arg)
+            }
+        };
+
+        match std::fs::canonicalize(&target) {
+            Ok(canon) => {
+                if !canon.is_dir() {
+                    self.add_output(OutputLine::error(format!("cd: {}: Not a directory", arg)));
+                    return;
+                }
+                let mut s = canon.to_string_lossy().to_string();
+                // Strip the Windows verbatim (`\\?\`) prefix for clean display.
+                if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                    s = stripped.to_string();
+                }
+                let _ = std::env::set_current_dir(&s);
+                self.current_dir = s;
+                self.needs_redraw = true;
+            }
+            Err(_) => {
+                self.add_output(OutputLine::error(format!(
+                    "cd: {}: No such file or directory",
+                    if arg.is_empty() { "~" } else { arg }
+                )));
+            }
         }
     }
 
