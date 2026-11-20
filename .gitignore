@@ -3,3 +3,6 @@ target/
 # Windows crash dumps and runtime logs
 *.stackdump
 *.log
+
+# rotated daemon logs
+*.log.bak
