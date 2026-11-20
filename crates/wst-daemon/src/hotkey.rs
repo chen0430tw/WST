@@ -92,12 +92,72 @@ pub enum HotkeyEvent {
     Custom(u32),
 }
 
+/// Kill all running wst-ui.exe processes (orphans from a previous daemon instance).
+#[cfg(windows)]
+fn kill_orphaned_wst_ui() {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
+        PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    let current_pid = std::process::id();
+
+    unsafe {
+        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("kill_orphaned_wst_ui: snapshot failed: {}", e);
+                return;
+            }
+        };
+
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+
+        if Process32FirstW(snap, &mut entry).is_err() {
+            let _ = windows::Win32::Foundation::CloseHandle(snap);
+            return;
+        }
+
+        loop {
+            // Convert null-terminated wide string to Rust string
+            let name_len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..name_len]);
+
+            if name.eq_ignore_ascii_case("wst-ui.exe") && entry.th32ProcessID != current_pid {
+                tracing::info!("kill_orphaned_wst_ui: killing PID {} ({})", entry.th32ProcessID, name);
+                if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, entry.th32ProcessID) {
+                    let _ = TerminateProcess(h, 1);
+                    let _ = windows::Win32::Foundation::CloseHandle(h);
+                }
+            }
+
+            if Process32NextW(snap, &mut entry).is_err() {
+                break;
+            }
+        }
+
+        let _ = windows::Win32::Foundation::CloseHandle(snap);
+    }
+}
+
+#[cfg(not(windows))]
+fn kill_orphaned_wst_ui() {}
+
 /// Run the hotkey listener
 pub async fn run_hotkey_listener(
     state: Arc<DaemonState>,
     mut event_rx: mpsc::Receiver<HotkeyEvent>,
 ) -> Result<()> {
     tracing::info!("Hotkey listener starting");
+
+    // Kill any wst-ui.exe processes left over from a previous daemon instance
+    // so they don't accumulate as hidden orphans blocking the hotkey.
+    tracing::info!("Killing orphaned wst-ui processes...");
+    kill_orphaned_wst_ui();
 
     // Track the PID of the launched wst-ui process
     let mut ui_pid: Option<u32> = None;
@@ -210,9 +270,18 @@ async fn launch_or_focus_ui(ui_pid: &mut Option<u32>) -> Result<()> {
         use windows::core::PWSTR;
         use std::os::windows::ffi::OsStrExt;
 
-        let exe_wide: Vec<u16> = exe_abs.as_os_str()
+        // Strip the \\?\ extended-length prefix that canonicalize() adds —
+        // CreateProcessW lpCurrentDirectory does not accept UNC-style \\?\ paths
+        // and CMD.exe would default to C:\Windows if given one.
+        let strip_unc = |s: std::borrow::Cow<str>| -> String {
+            s.strip_prefix("\\\\?\\").unwrap_or(&s).to_string()
+        };
+        let exe_str = strip_unc(exe_abs.to_string_lossy());
+        let dir_str = strip_unc(project_root.to_string_lossy());
+
+        let exe_wide: Vec<u16> = std::ffi::OsStr::new(&exe_str)
             .encode_wide().chain(std::iter::once(0)).collect();
-        let dir_wide: Vec<u16> = project_root.as_os_str()
+        let dir_wide: Vec<u16> = std::ffi::OsStr::new(&dir_str)
             .encode_wide().chain(std::iter::once(0)).collect();
 
         let mut si = STARTUPINFOW {
@@ -287,14 +356,14 @@ async fn close_ui(ui_pid: &mut Option<u32>) -> Result<()> {
             match hide_ui_window() {
                 Ok(()) => {
                     tracing::info!("UI window hidden successfully");
-                    return Ok(());
                 }
                 Err(e) => {
-                    tracing::warn!("Hide window failed: {}, killing process", e);
-                    kill_ui_pid(pid);
-                    *ui_pid = None;
+                    // HWND may be stale (e.g. console window recreated after fullscreen).
+                    // The process is still alive — just log and leave it. Do NOT kill.
+                    tracing::warn!("hide_ui_window failed ({}), leaving process alive", e);
                 }
             }
+            return Ok(());
         }
         #[cfg(not(windows))]
         {
@@ -313,9 +382,11 @@ fn show_ui_window(first_show: bool) -> Result<()> {
     use windows::Win32::UI::WindowsAndMessaging::{
         ShowWindow, SetForegroundWindow, IsWindow, BringWindowToTop,
         SetWindowPos, SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE, SW_SHOW,
-        PostMessageW, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
-    use windows::Win32::Foundation::{WPARAM, LPARAM};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        keybd_event, KEYEVENTF_KEYUP,
+        VK_F11, VK_RETURN, VK_MENU,
+    };
     use std::thread;
     use std::time::Duration;
 
@@ -339,8 +410,9 @@ fn show_ui_window(first_show: bool) -> Result<()> {
 
         if first_show {
             // First launch: window is hidden and not yet fullscreen.
-            // Move off-screen first so the user doesn't see the normal-size flash,
-            // then show it, wait for conhost to be ready, and toggle fullscreen.
+            // Move off-screen, show, focus, then inject keystrokes via keybd_event.
+            // keybd_event (SendInput family) injects into the foreground window —
+            // more reliable than PostMessage for conhost fullscreen toggles.
             let _ = SetWindowPos(hwnd, None, -32000, -32000, 0, 0,
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             let _ = ShowWindow(hwnd, SW_SHOW);
@@ -349,11 +421,19 @@ fn show_ui_window(first_show: bool) -> Result<()> {
 
             thread::sleep(Duration::from_millis(300));
 
-            let _ = PostMessageW(hwnd, WM_KEYDOWN,    WPARAM(0x7A), LPARAM(0x00570001));
-            let _ = PostMessageW(hwnd, WM_KEYUP,      WPARAM(0x7A), LPARAM(0xC0570001u64 as _));
+            // Try F11 first (Windows Terminal fullscreen)
+            keybd_event(VK_F11.0 as u8, 0x57, Default::default(), 0);
+            thread::sleep(Duration::from_millis(50));
+            keybd_event(VK_F11.0 as u8, 0x57, KEYEVENTF_KEYUP, 0);
+
             thread::sleep(Duration::from_millis(200));
-            let _ = PostMessageW(hwnd, WM_SYSKEYDOWN, WPARAM(0x0D), LPARAM(0x201C0001));
-            let _ = PostMessageW(hwnd, WM_SYSKEYUP,   WPARAM(0x0D), LPARAM(0xC01C0001u64 as _));
+
+            // Then Alt+Enter (legacy conhost fullscreen)
+            keybd_event(VK_MENU.0 as u8, 0x38, Default::default(), 0);
+            keybd_event(VK_RETURN.0 as u8, 0x1C, Default::default(), 0);
+            thread::sleep(Duration::from_millis(50));
+            keybd_event(VK_RETURN.0 as u8, 0x1C, KEYEVENTF_KEYUP, 0);
+            keybd_event(VK_MENU.0 as u8, 0x38, KEYEVENTF_KEYUP, 0);
         } else {
             // Re-show: window was hidden while already fullscreen (SW_HIDE preserves state).
             // Just show it — it comes back fullscreen directly.
@@ -392,7 +472,9 @@ fn hide_ui_window() -> Result<()> {
 
     unsafe {
         if !IsWindow(hwnd).as_bool() {
-            return Err(anyhow::anyhow!("wst-ui window is no longer valid"));
+            // Window already gone — treat as already hidden, not an error.
+            tracing::warn!("hide_ui_window: HWND {:?} no longer valid, treating as hidden", hwnd);
+            return Ok(());
         }
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
@@ -491,78 +573,86 @@ fn find_wst_ui_executable() -> String {
         .unwrap_or_else(|| "wst-ui.exe".to_string())
 }
 
-/// Start the hotkey manager in a background thread using win-hotkeys
+/// Start the hotkey thread using Windows RegisterHotKey API directly.
+/// RegisterHotKey with MOD_NOREPEAT only fires on a clean key-down edge,
+/// preventing spurious re-triggers from modifier key state drift (the bug
+/// that affected the win_hotkeys crate approach).
 #[cfg(windows)]
 pub fn start_hotkey_thread(
     config: HotkeyConfig,
     event_tx: mpsc::Sender<HotkeyEvent>,
 ) -> Result<std::thread::JoinHandle<()>> {
     use std::thread;
-    use win_hotkeys::VKey;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        RegisterHotKey, UnregisterHotKey, GetKeyState, HOT_KEY_MODIFIERS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY};
 
     let (modifiers, vk) = config.as_modifiers_and_vk();
 
-    tracing::info!("=== Starting hotkey thread ===");
-    tracing::info!("Config: modifiers={:#x}, vk={:#x}", modifiers, vk);
+    // MOD_NOREPEAT (0x4000): only fire on the initial key-down, not while held.
+    // This is the key flag that prevents modifier-state drift false triggers.
+    const MOD_NOREPEAT: u32 = 0x4000;
+    let reg_mods = modifiers | MOD_NOREPEAT;
 
-    // Convert our virtual key code to win-hotkeys VKey
-    let trigger_key = vk_to_vkey(vk)?;
-    tracing::info!("Trigger key: {:?}", trigger_key);
-
-    // Convert our modifiers to VKey slice
-    let mut mod_keys = Vec::new();
-    if modifiers & MOD_CONTROL != 0 {
-        mod_keys.push(VKey::Control);
-        tracing::info!("Added Control modifier");
-    }
-    if modifiers & MOD_ALT != 0 {
-        mod_keys.push(VKey::LMenu); // LMenu = Left Alt
-        tracing::info!("Added Alt modifier (LMenu)");
-    }
-    if modifiers & MOD_SHIFT != 0 {
-        mod_keys.push(VKey::Shift);
-        tracing::info!("Added Shift modifier");
-    }
-    if modifiers & MOD_WIN != 0 {
-        mod_keys.push(VKey::LWin);
-        tracing::info!("Added Win modifier");
-    }
+    tracing::info!("=== Starting hotkey thread (RegisterHotKey) ===");
+    tracing::info!("modifiers={:#x} (with MOD_NOREPEAT), vk={:#x}", reg_mods, vk);
 
     let handle = thread::spawn(move || {
-        tracing::info!("Hotkey thread started, creating HotkeyManager");
+        const HOTKEY_ID: i32 = 1;
+        const DEBOUNCE_MS: u128 = 300;
+        let mut last_trigger = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1000))
+            .unwrap_or(std::time::Instant::now());
 
-        // Create hotkey manager
-        let mut hm = win_hotkeys::HotkeyManager::new();
-
-        // Register the hotkey
-        tracing::info!("Attempting to register hotkey:");
-        tracing::info!("  Trigger: {:?}", trigger_key);
-        tracing::info!("  Modifiers: {:?}", mod_keys);
-
-        match hm.register_hotkey(trigger_key, &mod_keys, move || {
-            tracing::info!("*** HOTKEY TRIGGERED! ***");
-            tracing::info!("Sending ToggleFrontend event...");
-
-            match event_tx.try_send(HotkeyEvent::ToggleFrontend) {
-                Ok(_) => tracing::info!("Event sent successfully"),
-                Err(e) => tracing::error!("Failed to send event: {}", e),
+        unsafe {
+            match RegisterHotKey(HWND::default(), HOTKEY_ID, HOT_KEY_MODIFIERS(reg_mods), vk) {
+                Ok(()) => tracing::info!("RegisterHotKey OK"),
+                Err(e) => {
+                    tracing::error!("RegisterHotKey failed: {}", e);
+                    return;
+                }
             }
-        }) {
-            Ok(id) => {
-                tracing::info!("Hotkey registered successfully!");
-                tracing::info!("Hotkey ID: {:?}", id);
-                tracing::info!("Press hotkey to toggle WST UI...");
+
+            tracing::info!("Hotkey registered, entering message loop...");
+            let mut msg = MSG::default();
+            loop {
+                let ret = GetMessageW(&mut msg, HWND::default(), 0, 0);
+                if ret.0 == 0 {
+                    tracing::info!("Hotkey thread: WM_QUIT");
+                    break;
+                }
+                if ret.0 < 0 {
+                    tracing::error!("GetMessageW error");
+                    break;
+                }
+                if msg.message == WM_HOTKEY && msg.wParam.0 as i32 == HOTKEY_ID {
+                    let now = std::time::Instant::now();
+                    let elapsed = now.duration_since(last_trigger).as_millis();
+                    // Log exact modifier state at trigger time for debugging.
+                    let ctrl  = GetKeyState(0x11_i32); // VK_CONTROL
+                    let alt   = GetKeyState(0x12_i32); // VK_MENU
+                    let shift = GetKeyState(0x10_i32); // VK_SHIFT
+                    tracing::info!(
+                        "*** HOTKEY TRIGGERED *** ctrl={:#06x} alt={:#06x} shift={:#06x} elapsed={}ms",
+                        ctrl as u16, alt as u16, shift as u16, elapsed
+                    );
+                    if elapsed < DEBOUNCE_MS {
+                        tracing::warn!("Debounced spurious trigger ({}ms < {}ms)", elapsed, DEBOUNCE_MS);
+                    } else {
+                        last_trigger = now;
+                        match event_tx.try_send(HotkeyEvent::ToggleFrontend) {
+                            Ok(_) => tracing::info!("ToggleFrontend event sent"),
+                            Err(e) => tracing::error!("Failed to send event: {}", e),
+                        }
+                    }
+                }
             }
-            Err(e) => {
-                tracing::error!("Failed to register hotkey: {}", e);
-            }
+
+            let _ = UnregisterHotKey(HWND::default(), HOTKEY_ID);
         }
-
-        // Run the event loop
-        tracing::info!("Entering event loop...");
-        hm.event_loop();
-
-        tracing::info!("Hotkey event loop exited");
+        tracing::info!("Hotkey thread exited");
     });
 
     Ok(handle)
