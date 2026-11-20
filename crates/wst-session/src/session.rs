@@ -271,7 +271,8 @@ mod tests {
         assert_eq!(session.name(), "test-session");
         assert_eq!(session.state(), SessionState::Initializing);
         assert!(session.is_active());
-        assert!(session.is_idle());
+        // Initializing is not idle: cleanup_idle_sessions must not reap it.
+        assert!(!session.is_idle());
     }
 
     #[test]

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "apps/wst-ui",
+    "apps/wst-conpty-broker",
     "crates/wst-core",
     "crates/wst-backend",
     "crates/wst-protocol",

@@ -1,0 +1,12 @@
+[package]
+name = "wst-conpty-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wst-conpty-broker"
+path = "src/main.rs"
+
+[dependencies]
+windows = { workspace = true }

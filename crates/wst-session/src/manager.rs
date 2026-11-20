@@ -69,10 +69,10 @@ impl SessionManager {
 
     /// Create a new session
     pub async fn create_session(&self, config: SessionConfig) -> Result<SessionId> {
-        // Check max sessions limit
-        let sessions = self.sessions.read().await;
-        if sessions.len() >= self.config.max_sessions {
-            drop(sessions);
+        // Check max sessions limit. The read guard must be released before the
+        // write() below — tokio's RwLock deadlocks if both are held.
+        let at_limit = self.sessions.read().await.len() >= self.config.max_sessions;
+        if at_limit {
             // Try to close a non-persistent idle session first
             self.cleanup_idle_sessions().await?;
         }
@@ -337,9 +337,18 @@ impl Default for SessionManager {
 mod tests {
     use super::*;
 
+    /// In-memory manager: tests must not write snapshots into ~/.wst/sessions.
+    fn test_manager() -> SessionManager {
+        SessionManager::with_config(SessionManagerConfig {
+            persist_sessions: false,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn test_create_session() {
-        let manager = SessionManager::new().unwrap();
+        let manager = test_manager();
         let config = SessionConfig {
             name: "test".to_string(),
             ..Default::default()
@@ -354,7 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_switch_session() {
-        let manager = SessionManager::new().unwrap();
+        let manager = test_manager();
 
         let id1 = manager.create_session(SessionConfig::default()).await.unwrap();
         let id2 = manager.create_session(SessionConfig::default()).await.unwrap();
@@ -368,7 +377,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_close_session() {
-        let manager = SessionManager::new().unwrap();
+        let manager = test_manager();
 
         let id = manager.create_session(SessionConfig::default()).await.unwrap();
         manager.close_session(id).await.unwrap();
@@ -377,7 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_management() {
-        let manager = SessionManager::new().unwrap();
+        let manager = test_manager();
 
         let id = manager.create_session(SessionConfig::default()).await.unwrap();
         manager.add_task(id, 1).await.unwrap();

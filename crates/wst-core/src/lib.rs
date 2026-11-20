@@ -73,6 +73,12 @@ impl History {
         self.entries.iter().map(|e| e.command.clone()).collect()
     }
 
+    /// Non-destructive peek at the entry just before current index (for right-arrow history fill).
+    pub fn peek_prev(&self) -> Option<&str> {
+        let idx = self.index.saturating_sub(1);
+        self.entries.get(idx).map(|e| e.command.as_str())
+    }
+
     pub fn search(&self, prefix: &str) -> Vec<&str> {
         self.entries
             .iter()
@@ -141,6 +147,29 @@ impl WstCore {
         self.backend_manager.exec(session, req).map_err(|e| anyhow!("{}", e))
     }
 
+    /// Record a command in history without executing it. Used when the executed
+    /// form differs from what the user typed (e.g. root mode wraps it in
+    /// `sudo su root …` but history should show the original).
+    pub fn push_history(&mut self, command: String) {
+        if !command.trim().is_empty() {
+            self.history.add(command);
+        }
+    }
+
+    /// Execute a command line verbatim without recording it in history.
+    pub fn exec_raw(&mut self, command: String) -> Result<TaskId> {
+        if command.trim().is_empty() {
+            return Err(anyhow!("empty command"));
+        }
+        let session = self.ensure_session()?;
+        let req = ExecRequest {
+            command_line: command,
+            cwd: None,
+            env: vec![],
+        };
+        self.backend_manager.exec(session, req).map_err(|e| anyhow!("{}", e))
+    }
+
     pub fn exec_with_session(&mut self, session: SessionId, command: String) -> Result<TaskId> {
         if command.trim().is_empty() {
             return Err(anyhow!("empty command"));
@@ -189,6 +218,11 @@ impl WstCore {
         self.history.reset();
     }
 
+    /// Non-destructive peek for right-arrow history fill (ReactOS PeekHistory pattern).
+    pub fn history_peek_prev(&self) -> Option<String> {
+        self.history.peek_prev().map(|s| s.to_string())
+    }
+
     pub fn switch_backend(&mut self, kind: BackendKind) -> Result<()> {
         self.backend_manager.switch_backend(kind)
     }
@@ -209,7 +243,7 @@ impl BackendManager {
         backends.insert(BackendKind::Cmd, Box::new(CmdBackend::new()));
         backends.insert(BackendKind::Pwsh, Box::new(PwshBackend::new()));
         backends.insert(BackendKind::Cygctl, Box::new(CygctlBackend::new(&config.cygctl_path)));
-        backends.insert(BackendKind::ConPty, Box::new(ConPtyBackend::new("cmd.exe")));
+        backends.insert(BackendKind::ConPty, Box::new(ConPtyBackend::new("powershell.exe")));
 
         Self {
             backends,
@@ -229,7 +263,7 @@ impl BackendManager {
                 BackendKind::Cmd => Box::new(CmdBackend::new()),
                 BackendKind::Pwsh => Box::new(PwshBackend::new()),
                 BackendKind::Cygctl => Box::new(CygctlBackend::new("cygctl")),
-                BackendKind::ConPty => Box::new(ConPtyBackend::new("cmd.exe")),
+                BackendKind::ConPty => Box::new(ConPtyBackend::new("powershell.exe")),
             };
             self.backends.insert(kind, backend);
         }
@@ -239,6 +273,11 @@ impl BackendManager {
 
     pub fn ensure_session(&mut self) -> Result<SessionId> {
         let kind = self.default_backend;
+        // Reuse an existing active session for this backend if one exists.
+        let backend = self.get_backend(kind);
+        if let Some(&sid) = backend.active_session_ids().first() {
+            return Ok(sid);
+        }
         let backend = self.get_backend(kind);
         let sid = backend.spawn_session().map_err(|e| anyhow!("{}", e))?;
         self.session_owners.insert(sid, kind);

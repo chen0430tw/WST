@@ -131,12 +131,12 @@ fn set_legacy_console_fullscreen() {
 }
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
     style::{Color, Style},
-    text::{Line, Span},
+    text::Span,
     widgets::Paragraph,
     Frame, Terminal,
 };
+use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -148,39 +148,110 @@ use wst_protocol::{BackendKind, SessionEvent, TaskStatus};
 #[allow(dead_code)]
 const INPUT_PROMPT: &str = ">";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Console login banner in the style of a Linux getty/login on tty1:
+///
+/// ```text
+/// WST 0.1.0 host tty1
+///
+/// host login: user
+/// Welcome to WST 0.1.0 (Windows NT 10.0.19045 x86_64)
+///
+///  * Commands:  type :help
+///
+/// Last login: Fri Nov 20 03:40:12 2026 on tty1
+/// ```
+fn login_banner(hostname: &str, username: &str) -> VecDeque<OutputLine> {
+    let mut lines = VecDeque::from([
+        OutputLine::normal(format!("WST {} {} tty1", VERSION, hostname)),
+        OutputLine::normal(""),
+        OutputLine::normal(format!("{} login: {}", hostname, username)),
+        OutputLine::normal(format!(
+            "Welcome to WST {} ({} {})",
+            VERSION,
+            kernel_version(),
+            std::env::consts::ARCH
+        )),
+        OutputLine::normal(""),
+        OutputLine::normal(" * Commands:  type :help"),
+        OutputLine::normal(""),
+    ]);
+    if let Some(last) = swap_last_login() {
+        lines.push_back(OutputLine::normal(format!("Last login: {} on tty1", last)));
+    }
+    lines
+}
+
+/// "Windows NT 10.0.19045" — the counterpart of "GNU/Linux 5.15.0-91-generic".
+/// RtlGetVersion is used because GetVersionEx lies without an app manifest.
+fn kernel_version() -> String {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct OsVersionInfoW {
+            size: u32,
+            major: u32,
+            minor: u32,
+            build: u32,
+            platform: u32,
+            csd: [u16; 128],
+        }
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
+        }
+        let mut info = OsVersionInfoW {
+            size: std::mem::size_of::<OsVersionInfoW>() as u32,
+            major: 0,
+            minor: 0,
+            build: 0,
+            platform: 0,
+            csd: [0; 128],
+        };
+        if unsafe { RtlGetVersion(&mut info) } == 0 {
+            return format!("Windows NT {}.{}.{}", info.major, info.minor, info.build);
+        }
+    }
+    "Windows NT".to_string()
+}
+
+/// Returns the previous login time (if any) and records the current one,
+/// like pam_lastlog. Stored in ~/.wst/lastlog.
+fn swap_last_login() -> Option<String> {
+    let home = std::env::var("USERPROFILE").ok()?;
+    let path = std::path::Path::new(&home).join(".wst").join("lastlog");
+    let previous = std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let now = chrono::Local::now().format("%a %b %e %H:%M:%S %Y").to_string();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, now);
+    previous
+}
+const MAX_SCROLLBACK: usize = 10_000;
 #[allow(dead_code)]
 const CP_UTF8: u32 = 65001;
 
-#[derive(Clone)]
 struct OutputLine {
     text: String,
     is_error: bool,
     is_system: bool,
+    /// Cached parsed ANSI lines — populated lazily on first draw, reused every frame.
+    cached_lines: Option<Vec<ratatui::text::Line<'static>>>,
 }
 
 impl OutputLine {
     fn normal(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            is_error: false,
-            is_system: false,
-        }
+        Self { text: text.into(), is_error: false, is_system: false, cached_lines: None }
     }
-
     fn error(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            is_error: true,
-            is_system: false,
-        }
+        Self { text: text.into(), is_error: true, is_system: false, cached_lines: None }
     }
-
     fn system(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            is_error: false,
-            is_system: true,
-        }
+        Self { text: text.into(), is_error: false, is_system: true, cached_lines: None }
     }
 }
 
@@ -188,7 +259,7 @@ struct AppState {
     core: Arc<tokio::sync::Mutex<WstCore>>,
     input: String,
     cursor_position: usize,
-    output: Vec<OutputLine>,
+    output: VecDeque<OutputLine>,
     running: bool,
     session_id: Option<u64>,
     scroll_offset: usize,
@@ -200,10 +271,18 @@ struct AppState {
     username: String,
     prompt_char: String,
     debug_mode: bool,
+    needs_redraw: bool,
+    insert_mode: bool,
+    last_key_was_tab: bool,
     // Debug stats
     lines_received: usize,
     last_command: String,
     backend_encoding: String,
+    // Root mode: commands are wrapped with `sudo su root` so they run as
+    // SYSTEM (rewritten to "root" by cygctl su). The prompt shows `#`.
+    root_mode: bool,
+    pre_root_user: String,
+    pre_root_prompt: String,
 }
 
 impl AppState {
@@ -223,6 +302,8 @@ impl AppState {
         let username = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string()).to_lowercase();
         let home_dir = std::env::var("USERPROFILE").unwrap_or_else(|_| current_dir.clone());
         let current_dir = home_dir.clone();
+        // Set the actual process CWD so backend processes inherit the correct directory.
+        let _ = std::env::set_current_dir(&current_dir);
 
         // Check if running as admin (for # vs $ prompt)
         #[cfg(windows)]
@@ -254,14 +335,7 @@ impl AppState {
             core,
             input: String::new(),
             cursor_position: 0,
-            output: vec![
-                OutputLine::normal(format!("WST v{} {} tty1", VERSION, hostname)),
-                OutputLine::normal(""),
-                OutputLine::normal(format!("{} login: {}", hostname, username)),
-                OutputLine::normal(""),
-                OutputLine::normal(format!("Welcome to WST v{} (Windows Subsystem for TTY)", VERSION)),
-                OutputLine::normal(""),
-            ],
+            output: login_banner(&hostname, &username),
             running: true,
             session_id: None,
             scroll_offset: 0,
@@ -273,14 +347,77 @@ impl AppState {
             username,
             prompt_char: prompt_char.to_string(),
             debug_mode: false,
+            needs_redraw: true,
+            insert_mode: true,
+            last_key_was_tab: false,
             lines_received: 0,
             last_command: String::new(),
             backend_encoding: "UTF-8".to_string(),
+            root_mode: false,
+            pre_root_user: String::new(),
+            pre_root_prompt: String::new(),
         }
     }
 
+    /// Classifies a typed line as a request to become root (`su`, `sudo -i`, …)
+    /// so WST can enter root mode instead of forwarding it to the backend.
+    fn is_become_root(cmd: &str) -> bool {
+        matches!(
+            cmd.split_whitespace().collect::<Vec<_>>().as_slice(),
+            ["su"]
+                | ["su", "root"]
+                | ["su", "-"]
+                | ["su", "-", "root"]
+                | ["su", "-l"]
+                | ["su", "-l", "root"]
+                | ["sudo", "-i"]
+                | ["sudo", "-s"]
+                | ["sudo", "su"]
+                | ["sudo", "su", "root"]
+                | ["sudo", "-i", "root"]
+        )
+    }
+
+    /// Enter root mode: remember the current identity, switch the prompt to `#`
+    /// and the displayed user to `root`. Commands are elevated lazily, so the
+    /// first real command (not this one) is what may trigger the single UAC
+    /// prompt for the cygsec elevation daemon.
+    fn enter_root_mode(&mut self) {
+        if self.root_mode {
+            return;
+        }
+        self.pre_root_user = self.username.clone();
+        self.pre_root_prompt = self.prompt_char.clone();
+        self.root_mode = true;
+        self.username = "root".to_string();
+        self.prompt_char = "#".to_string();
+    }
+
+    /// Leave root mode (triggered by `exit`/`logout`), restoring the prompt.
+    fn leave_root_mode(&mut self) {
+        if !self.root_mode {
+            return;
+        }
+        self.root_mode = false;
+        self.username = std::mem::take(&mut self.pre_root_user);
+        self.prompt_char = std::mem::take(&mut self.pre_root_prompt);
+    }
+
     fn handle_input(&mut self, key: KeyEvent) {
+        self.needs_redraw = true;
+        let prev_tab = self.last_key_was_tab;
+        self.last_key_was_tab = false;
+
         match key.code {
+            KeyCode::Tab => {
+                self.handle_tab(prev_tab);
+                self.last_key_was_tab = true;
+                return;
+            }
+            KeyCode::Insert => {
+                self.insert_mode = !self.insert_mode;
+                return;
+            }
             KeyCode::Enter => self.execute_command(),
             // Ctrl+P/N for command history (must come before generic Char)
             KeyCode::Char('p') | KeyCode::Char('P') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -304,14 +441,26 @@ impl AppState {
             }
             KeyCode::Char(c) => {
                 if !c.is_control() {
-                    self.input.insert(self.cursor_position, c);
+                    if self.insert_mode || self.cursor_position >= self.input.len() {
+                        self.input.insert(self.cursor_position, c);
+                    } else {
+                        // Overwrite mode: replace char at cursor
+                        self.input.remove(self.cursor_position);
+                        self.input.insert(self.cursor_position, c);
+                    }
                     self.move_cursor_right();
                 }
             }
             KeyCode::Backspace => {
                 if self.cursor_position > 0 {
-                    self.input.remove(self.cursor_position - 1);
-                    self.move_cursor_left();
+                    // Find previous char boundary and remove that char
+                    let prev = self.input[..self.cursor_position]
+                        .char_indices()
+                        .last()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    self.input.remove(prev);
+                    self.cursor_position = prev;
                 }
             }
             KeyCode::Delete => {
@@ -320,7 +469,25 @@ impl AppState {
                 }
             }
             KeyCode::Left => self.move_cursor_left(),
-            KeyCode::Right => self.move_cursor_right(),
+            KeyCode::Right => {
+                if self.cursor_position < self.input.len() {
+                    self.move_cursor_right();
+                } else {
+                    // At end of line: peek-history fill (ReactOS PeekHistory pattern)
+                    let peek = if let Ok(core) = self.core.try_lock() {
+                        core.history_peek_prev()
+                    } else {
+                        None
+                    };
+                    if let Some(hist) = peek {
+                        // cursor_position is a byte offset; get next char at that offset
+                        if let Some(ch) = hist.get(self.cursor_position..).and_then(|s| s.chars().next()) {
+                            self.input.push(ch);
+                            self.cursor_position += ch.len_utf8();
+                        }
+                    }
+                }
+            }
             KeyCode::Home => self.cursor_position = 0,
             KeyCode::End => self.cursor_position = self.input.len(),
             KeyCode::Up => {
@@ -384,12 +551,21 @@ impl AppState {
     }
 
     fn move_cursor_left(&mut self) {
-        self.cursor_position = self.cursor_position.saturating_sub(1);
+        if self.cursor_position > 0 {
+            // Retreat to previous char boundary (handles multi-byte UTF-8)
+            self.cursor_position = self.input[..self.cursor_position]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+        }
     }
 
     fn move_cursor_right(&mut self) {
         if self.cursor_position < self.input.len() {
-            self.cursor_position += 1;
+            // Advance by byte length of next char (handles multi-byte UTF-8)
+            let ch = self.input[self.cursor_position..].chars().next().unwrap();
+            self.cursor_position += ch.len_utf8();
         }
     }
 
@@ -415,27 +591,57 @@ impl AppState {
             "\x1b[32m{}@{}\x1b[0m:\x1b[36m{}\x1b[0m{} {}",
             self.username, self.hostname, self.display_dir(), self.prompt_char, command
         );
-        self.output.push(OutputLine::normal(echoed));
+        self.output.push_back(OutputLine::normal(echoed));
         self.scroll_to_bottom();
 
         // Track command and reset stats
         self.last_command = command.clone();
         self.lines_received = 0;
 
+        // Root-mode transitions are handled by WST itself, not the backend.
+        if Self::is_become_root(&command) {
+            self.enter_root_mode();
+            self.input.clear();
+            self.cursor_position = 0;
+            return;
+        }
+        if self.root_mode
+            && (command.eq_ignore_ascii_case("exit") || command.eq_ignore_ascii_case("logout"))
+        {
+            self.leave_root_mode();
+            self.input.clear();
+            self.cursor_position = 0;
+            return;
+        }
+
         if command.starts_with(':') {
             self.handle_builtin(&command);
         } else {
-            if let Ok(mut core) = self.core.try_lock() {
-                // Reset session if backend was switched
-                if let Ok(sid) = core.ensure_session() {
-                    self.session_id = Some(sid);
+            let session_err: Option<String> = if let Ok(mut core) = self.core.try_lock() {
+                match core.ensure_session() {
+                    Ok(sid) => { self.session_id = Some(sid); None }
+                    Err(e) => Some(e.to_string())
                 }
-                match core.exec(command.clone()) {
+            } else { None };
+            if let Some(err) = session_err {
+                self.add_output(OutputLine::error(format!("Session error: {}", err)));
+                return;
+            }
+            // In root mode, run every command as SYSTEM via `sudo su root`.
+            // History and the echoed line keep the command the user typed.
+            let actual = if self.root_mode {
+                format!("sudo su root {}", command)
+            } else {
+                command.clone()
+            };
+            if let Ok(mut core) = self.core.try_lock() {
+                core.push_history(command.clone());
+                match core.exec_raw(actual) {
                     Ok(_tid) => {
                         self.current_task_id = Some(_tid);
                     }
                     Err(e) => {
-                        self.output.push(OutputLine::error(format!("Error: {}", e)));
+                        self.output.push_back(OutputLine::error(format!("Error: {}", e)));
                     }
                 }
             }
@@ -451,31 +657,29 @@ impl AppState {
 
         match cmd {
             ":help" => {
-                self.output.push(OutputLine::system("Builtin commands:"));
-                self.output.push(OutputLine::normal("  :help        - Show this help"));
-                self.output.push(OutputLine::normal("  :status      - Show current status"));
-                self.output.push(OutputLine::normal("  :clear       - Clear output"));
-                self.output.push(OutputLine::normal("  :history     - Show command history"));
-                self.output.push(OutputLine::normal("  :backend     - Switch backend (Cygctl|Pwsh|Cmd)"));
-                self.output.push(OutputLine::normal("  :debug       - Toggle debug mode"));
-                self.output.push(OutputLine::normal("  :exit / :q   - Exit WST"));
-                self.output.push(OutputLine::normal(""));
-                self.output.push(OutputLine::system("Keyboard shortcuts:"));
-                self.output.push(OutputLine::normal("  PageUp/Down  - Scroll output"));
-                self.output.push(OutputLine::normal("  Mouse wheel  - Scroll output"));
-                self.output.push(OutputLine::normal("  Shift+Drag   - Select text (Windows Terminal)"));
+                self.output.push_back(OutputLine::system("Builtin commands:"));
+                self.output.push_back(OutputLine::normal("  :help        - Show this help"));
+                self.output.push_back(OutputLine::normal("  :status      - Show current status"));
+                self.output.push_back(OutputLine::normal("  :clear       - Clear output"));
+                self.output.push_back(OutputLine::normal("  :history     - Show command history"));
+                self.output.push_back(OutputLine::normal("  :backend     - Switch backend (Cmd|ConPty|Pwsh|Cygctl)"));
+                self.output.push_back(OutputLine::normal("  :debug       - Toggle debug mode"));
+                self.output.push_back(OutputLine::normal("  :exit / :q   - Exit WST"));
+                self.output.push_back(OutputLine::normal(""));
+                self.output.push_back(OutputLine::system("Keyboard shortcuts:"));
+                self.output.push_back(OutputLine::normal("  PageUp/Down  - Scroll output"));
+                self.output.push_back(OutputLine::normal("  Mouse wheel  - Scroll output"));
+                self.output.push_back(OutputLine::normal("  Shift+Drag   - Select text (Windows Terminal)"));
             }
             ":status" => {
                 if let Ok(core) = self.core.try_lock() {
-                    self.output.push(OutputLine::system(format!(
+                    self.output.push_back(OutputLine::system(format!(
                         "WST v{} - Windows Subsystem for TTY",
                         VERSION
                     )));
-                    self.output
-                        .push(OutputLine::normal(format!("Backend: {:?}", core.default_backend())));
-                    self.output
-                        .push(OutputLine::normal(format!("Session: {:?}", self.session_id)));
-                    self.output.push(OutputLine::normal(format!(
+                    self.output.push_back(OutputLine::normal(format!("Backend: {:?}", core.default_backend())));
+                    self.output.push_back(OutputLine::normal(format!("Session: {:?}", self.session_id)));
+                    self.output.push_back(OutputLine::normal(format!(
                         "History: {} commands",
                         core.history().len()
                     )));
@@ -488,26 +692,25 @@ impl AppState {
             ":history" => {
                 if let Ok(core) = self.core.try_lock() {
                     for (i, entry) in core.history().iter().enumerate() {
-                        self.output
-                            .push(OutputLine::normal(format!("  {}: {}", i + 1, entry.command)));
+                        self.output.push_back(OutputLine::normal(format!("  {}: {}", i + 1, entry.command)));
                     }
                 }
             }
             ":backend" => {
                 if parts.len() < 2 {
                     if let Ok(core) = self.core.try_lock() {
-                        self.output.push(OutputLine::normal(format!(
+                        self.output.push_back(OutputLine::normal(format!(
                             "Current backend: {:?}",
                             core.default_backend()
                         )));
-                        self.output
-                            .push(OutputLine::normal("Usage: :backend <Cygctl|Pwsh|Cmd>"));
+                        self.output.push_back(OutputLine::normal("Usage: :backend <Cmd|ConPty|Pwsh|Cygctl>"));
                     }
                 } else {
                     let new_backend = match parts[1].to_lowercase().as_str() {
                         "cygctl" => Some(BackendKind::Cygctl),
                         "pwsh" => Some(BackendKind::Pwsh),
                         "cmd" => Some(BackendKind::Cmd),
+                        "conpty" | "conpry" | "contty" | "pty" => Some(BackendKind::ConPty),
                         _ => None,
                     };
 
@@ -515,7 +718,7 @@ impl AppState {
                         if let Ok(mut core) = self.core.try_lock() {
                             match core.switch_backend(kind) {
                                 Ok(()) => {
-                                    self.output.push(OutputLine::system(format!(
+                                    self.output.push_back(OutputLine::system(format!(
                                         "Switched to {:?} backend",
                                         kind
                                     )));
@@ -531,29 +734,129 @@ impl AppState {
                                     }
                                 }
                                 Err(e) => {
-                                    self.output.push(OutputLine::error(format!("Failed to switch: {}", e)));
+                                    self.output.push_back(OutputLine::error(format!("Failed to switch: {}", e)));
                                 }
                             }
                         }
                     } else {
-                        self.output
-                            .push(OutputLine::error("Unknown backend. Use: Cygctl, Pwsh, or Cmd"));
+                        self.output.push_back(OutputLine::error("Unknown backend. Use: Cmd, ConPty, Pwsh, or Cygctl"));
                     }
                 }
             }
             ":debug" => {
                 self.debug_mode = !self.debug_mode;
-                self.output.push(OutputLine::system(format!(
+                self.output.push_back(OutputLine::system(format!(
                     "Debug mode: {}",
                     if self.debug_mode { "ON" } else { "OFF" }
                 )));
             }
             ":exit" | ":q" => self.running = false,
             _ => {
-                self.output.push(OutputLine::error(format!("Unknown builtin: {}", cmd)));
-                self.output.push(OutputLine::normal("Type :help for available commands"));
+                self.output.push_back(OutputLine::error(format!("Unknown builtin: {}", cmd)));
+                self.output.push_back(OutputLine::normal("Type :help for available commands"));
             }
         }
+    }
+
+    fn handle_tab(&mut self, double_tab: bool) {
+        let input = self.input.clone();
+
+        // split: everything before the last token, and the token being completed
+        let (prefix_before, word) = match input.rfind(' ') {
+            Some(pos) => (&input[..=pos], &input[pos + 1..]),
+            None => ("", input.as_str()),
+        };
+
+        // split word into dir prefix and filename fragment
+        let sep_pos = word.rfind(|c| c == '/' || c == '\\' || c == ':');
+        let (dir_str, frag) = match sep_pos {
+            Some(pos) => (&word[..=pos], &word[pos + 1..]),
+            None => ("", word),
+        };
+
+        // resolve search directory
+        let search_dir = if dir_str.is_empty() {
+            self.current_dir.clone()
+        } else {
+            std::path::Path::new(&self.current_dir)
+                .join(dir_str)
+                .to_string_lossy()
+                .to_string()
+        };
+
+        let frag_lower = frag.to_ascii_lowercase();
+        let matches: Vec<String> = std::fs::read_dir(&search_dir)
+            .map(|rd| {
+                let mut v: Vec<String> = rd
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.to_ascii_lowercase().starts_with(&frag_lower) {
+                            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                            Some(if is_dir { format!("{}\\", name) } else { name })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                v.sort();
+                v
+            })
+            .unwrap_or_default();
+
+        if matches.is_empty() {
+            return;
+        }
+
+        if double_tab && matches.len() > 1 {
+            // Double Tab: echo current input then list all matches in columns
+            let echoed = format!(
+                "\x1b[32m{}@{}\x1b[0m:\x1b[36m{}\x1b[0m{} {}",
+                self.username, self.hostname, self.display_dir(), self.prompt_char, input
+            );
+            self.output.push_back(OutputLine::normal(echoed));
+            // Two-scan: find max width, then emit one line
+            let max_w = matches.iter().map(|s| s.len()).max().unwrap_or(1) + 2;
+            let cols = (80usize / max_w).max(1);
+            let mut line = String::new();
+            for (i, m) in matches.iter().enumerate() {
+                line.push_str(m);
+                if (i + 1) % cols == 0 {
+                    self.output.push_back(OutputLine::normal(line.clone()));
+                    line.clear();
+                } else {
+                    // pad to column width
+                    for _ in m.len()..max_w {
+                        line.push(' ');
+                    }
+                }
+            }
+            if !line.is_empty() {
+                self.output.push_back(OutputLine::normal(line));
+            }
+            while self.output.len() > MAX_SCROLLBACK {
+                self.output.pop_front();
+            }
+        } else {
+            // Single Tab: LCP completion
+            let lcp = matches.iter().skip(1).fold(matches[0].clone(), |acc, m| {
+                acc.chars()
+                    .zip(m.chars())
+                    .take_while(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+                    .map(|(a, _)| a)
+                    .collect()
+            });
+            let new_word = format!("{}{}", dir_str, lcp);
+            self.input = format!("{}{}", prefix_before, new_word);
+            self.cursor_position = self.input.len();
+            // beep if multiple matches (no unique completion)
+            if matches.len() > 1 {
+                print!("\x07");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+        }
+        self.needs_redraw = true;
     }
 
     fn display_dir(&self) -> &str {
@@ -569,75 +872,96 @@ impl AppState {
     }
 
     fn add_output(&mut self, line: OutputLine) {
-        self.output.push(line);
-        // Auto-scroll to bottom so new output is always visible
+        self.output.push_back(line);
+        if self.output.len() > MAX_SCROLLBACK {
+            self.output.pop_front();
+        }
         self.scroll_to_bottom();
+        self.needs_redraw = true;
     }
+}
+
+/// Visual rows a ratatui Line occupies at the given terminal width (accounting for wrap).
+fn line_vrows(line: &ratatui::text::Line, term_width: u16) -> u16 {
+    if term_width == 0 {
+        return 1;
+    }
+    let char_w: u16 = line
+        .spans
+        .iter()
+        .flat_map(|s| s.content.chars())
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(1) as u16)
+        .sum();
+    // An empty line still occupies 1 row.
+    (char_w.max(1) + term_width - 1) / term_width
 }
 
 fn draw_ui(f: &mut Frame, state: &mut AppState) {
     let size = f.size();
-
-    // Full area — pure TTY style, no status bar
     let area = size;
+    let term_width = area.width;
 
     let reserved = if state.debug_mode { 2u16 } else { 1u16 };
     let output_rows = area.height.saturating_sub(reserved);
 
-    // Calculate which output lines to show
-    let output_len = state.output.len();
-    let visible_count = output_rows as usize;
-    let (start, count) = if output_len <= visible_count {
-        (0, output_len)
-    } else {
-        let offset = state.scroll_offset.min(output_len - visible_count);
-        (output_len - visible_count - offset, visible_count)
-    };
-
-    // Build ratatui Lines from output, parsing ANSI escape sequences for color
-    let mut output_lines: Vec<ratatui::text::Line<'static>> = Vec::new();
-    for line in state.output.iter().skip(start).take(count) {
+    // Build all parsed lines.
+    let mut all_lines: Vec<ratatui::text::Line<'static>> = Vec::new();
+    for idx in 0..state.output.len() {
+        let line = &mut state.output[idx];
         if line.is_system {
-            output_lines.push(ratatui::text::Line::from(
+            all_lines.push(ratatui::text::Line::from(
                 Span::styled(line.text.clone(), Style::default().fg(Color::Cyan)),
             ));
         } else if line.is_error {
-            output_lines.push(ratatui::text::Line::from(
+            all_lines.push(ratatui::text::Line::from(
                 Span::styled(line.text.clone(), Style::default().fg(Color::Red)),
             ));
         } else {
-            // Parse ANSI escape sequences for color
-            match line.text.as_str().into_text() {
-                Ok(text) => output_lines.extend(text.lines),
-                Err(_) => output_lines.push(ratatui::text::Line::from(line.text.clone())),
+            if line.cached_lines.is_none() {
+                line.cached_lines = Some(match line.text.as_str().into_text() {
+                    Ok(text) => text.lines,
+                    Err(_) => vec![ratatui::text::Line::from(line.text.clone())],
+                });
             }
+            all_lines.extend(line.cached_lines.as_ref().unwrap().iter().cloned());
         }
     }
-    let actual_output_lines = output_lines.len() as u16;
 
-    let output_para = Paragraph::new(output_lines);
+    // Apply scroll: walk backwards from (total - scroll_offset), accumulating
+    // visual rows until we fill output_rows. This correctly handles wrapped lines.
+    let base = all_lines.len().saturating_sub(state.scroll_offset);
+    let mut accum: u16 = 0;
+    let mut start_idx = base;
+    for i in (0..base).rev() {
+        let vr = line_vrows(&all_lines[i], term_width);
+        if accum + vr > output_rows {
+            start_idx = i + 1;
+            break;
+        }
+        accum += vr;
+        start_idx = i;
+    }
+    let output_lines: Vec<_> = all_lines[start_idx..base].to_vec();
+
+    // Actual visual rows the selected lines occupy.
+    let actual_vrows: u16 = output_lines.iter().map(|l| line_vrows(l, term_width)).sum();
+
+    // Render output — height = actual_vrows so Paragraph doesn't add padding.
     let output_area = ratatui::layout::Rect {
         x: area.x,
         y: area.y,
         width: area.width,
-        height: actual_output_lines.min(output_rows),
+        height: actual_vrows.min(output_rows),
     };
-    f.render_widget(output_para, output_area);
+    f.render_widget(Paragraph::new(output_lines), output_area);
 
-    // y = area.y + actual lines rendered, clamped so input stays on screen
-    let y = (area.y + actual_output_lines).min(area.y + output_rows);
+    // Prompt sits directly below the last output line (TTY behaviour).
+    // Clamp so it never falls off screen.
+    let after_output = (area.y + actual_vrows).min(area.y + output_rows);
+    let input_y = after_output.min(area.y + area.height - 1);
+    let debug_y = input_y.saturating_sub(1);
 
-    // Acquire buffer for debug/input rendering (after output widget render)
     let buf = f.buffer_mut();
-
-    // Place debug and input right after last output line (clamped to area bounds)
-    let (debug_y, input_y) = if state.debug_mode {
-        let d = y.min(area.y + area.height - 2);
-        let i = (y + 1).min(area.y + area.height - 1);
-        (d, i)
-    } else {
-        (0, y.min(area.y + area.height - 1))
-    };
 
     // Add debug info on its row
     if state.debug_mode {
@@ -797,14 +1121,21 @@ fn run_app(
     let tick_rate = Duration::from_millis(100);
 
     while state.running {
-        terminal.draw(|f| draw_ui(f, &mut state))?;
+        if state.needs_redraw {
+            terminal.draw(|f| draw_ui(f, &mut state))?;
+            state.needs_redraw = false;
+        }
 
         // Process ALL available backend events
         loop {
             match rx.try_recv() {
                 Ok(AppEvent::Backend(SessionEvent::Output(chunk))) => {
                     state.lines_received += 1;
-                    if chunk.is_stderr {
+                    // Suppress cygctl su's "[su] Acquiring SYSTEM token…" status
+                    // line, which would otherwise precede every root-mode command.
+                    if state.root_mode && chunk.text.trim_start().starts_with("[su] ") {
+                        // swallow
+                    } else if chunk.is_stderr {
                         state.add_output(OutputLine::error(chunk.text));
                     } else {
                         state.add_output(OutputLine::normal(chunk.text));
@@ -820,6 +1151,7 @@ fn run_app(
                                     code
                                 )));
                             }
+                            state.needs_redraw = true;
                         }
                     }
                 }
@@ -838,6 +1170,7 @@ fn run_app(
                     } else {
                         state.scroll_output_down(3);
                     }
+                    state.needs_redraw = true;
                 }
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                     break; // No more events, exit loop
@@ -859,7 +1192,9 @@ fn run_app(
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.running = false;
                         }
-                        _ => state.handle_input(key),
+                        _ => {
+                            state.handle_input(key);
+                        }
                     }
                 }
                 _ => {}
@@ -963,4 +1298,35 @@ fn main() -> Result<()> {
 
     println!("WST exited. Goodbye!");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppState;
+
+    #[test]
+    fn become_root_patterns_are_recognized() {
+        for c in [
+            "su", "su root", "su -", "su - root", "su -l", "su -l root",
+            "sudo -i", "sudo -s", "sudo su", "sudo su root", "sudo -i root",
+        ] {
+            assert!(AppState::is_become_root(c), "should enter root: {c:?}");
+        }
+    }
+
+    #[test]
+    fn ordinary_commands_do_not_enter_root() {
+        for c in [
+            "whoami", "sudo apt update", "su someoneelse", "sudo su bob",
+            "ls -la", "sudoku", "super", "", "root",
+        ] {
+            assert!(!AppState::is_become_root(c), "should NOT enter root: {c:?}");
+        }
+    }
+
+    #[test]
+    fn become_root_tolerates_extra_whitespace() {
+        assert!(AppState::is_become_root("  sudo   su   root  "));
+        assert!(AppState::is_become_root("su\troot"));
+    }
 }

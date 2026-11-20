@@ -18,6 +18,7 @@ wst-config = { path = "../../crates/wst-config" }
 wst-protocol = { path = "../../crates/wst-protocol" }
 wst-backend = { path = "../../crates/wst-backend" }
 wst-hotkey = { path = "../../crates/wst-hotkey" }
+chrono = "0.4"
 unicode-width = "0.2.2"
 winput = "0.2"
 ansi-to-tui = "3"
