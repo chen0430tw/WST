@@ -617,12 +617,17 @@ impl AppState {
         if command.starts_with(':') {
             self.handle_builtin(&command);
         } else {
-            let session_err: Option<String> = if let Ok(mut core) = self.core.try_lock() {
+            // Use blocking_lock (not try_lock): poll_events is now non-blocking,
+            // so the tick task holds `core` only briefly. try_lock would silently
+            // drop the command if it happened to collide with that tick.
+            // Safe here because run_app runs on the main (non-async) thread.
+            let session_err: Option<String> = {
+                let mut core = self.core.blocking_lock();
                 match core.ensure_session() {
                     Ok(sid) => { self.session_id = Some(sid); None }
                     Err(e) => Some(e.to_string())
                 }
-            } else { None };
+            };
             if let Some(err) = session_err {
                 self.add_output(OutputLine::error(format!("Session error: {}", err)));
                 return;
@@ -634,7 +639,8 @@ impl AppState {
             } else {
                 command.clone()
             };
-            if let Ok(mut core) = self.core.try_lock() {
+            {
+                let mut core = self.core.blocking_lock();
                 core.push_history(command.clone());
                 match core.exec_raw(actual) {
                     Ok(_tid) => {

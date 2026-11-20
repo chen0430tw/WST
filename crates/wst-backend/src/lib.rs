@@ -2,8 +2,9 @@ pub mod conpty;
 pub use conpty::ConPtyBackend;
 
 use std::collections::HashMap;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 
 use thiserror::Error;
 use wst_protocol::{BackendKind, ExecRequest, OutputChunk, SessionEvent, SessionId, TaskId, TaskStatus};
@@ -56,13 +57,159 @@ pub trait Backend: Send {
     fn active_session_ids(&self) -> Vec<SessionId>;
 }
 
+/// One decoded line coming from a child's stdout/stderr reader thread.
+struct LineMsg {
+    is_stderr: bool,
+    text: String,
+}
+
 struct Task {
     child: Option<Child>,
     status: TaskStatus,
     output_buffer: Vec<String>,
     error_buffer: Vec<String>,
-    stdout_reader: Option<BufReader<std::process::ChildStdout>>,
-    stderr_reader: Option<BufReader<std::process::ChildStderr>>,
+    /// Lines streamed from the reader threads; drained non-blocking by `poll_events`.
+    rx: Option<Receiver<LineMsg>>,
+    /// Exit code once the process has been observed to exit.
+    exit_status: Option<i32>,
+    /// True once all reader threads have finished (channel disconnected).
+    readers_done: bool,
+}
+
+/// Spawn a background thread that reads `reader` line by line, decodes each line
+/// with the OEM code page, and sends it over `tx`. The thread exits on EOF, which
+/// drops its `tx` clone.
+fn spawn_reader<R: Read + Send + 'static>(reader: R, is_stderr: bool, tx: Sender<LineMsg>) {
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut reader = BufReader::new(reader);
+        let mut buf = Vec::new();
+        while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
+            let line = decode_oem_line(&buf);
+            if tx.send(LineMsg { is_stderr, text: line }).is_err() {
+                break; // receiver gone
+            }
+            buf.clear();
+        }
+        // tx dropped here -> contributes to channel disconnect
+    });
+}
+
+/// Build a running `Task` from a spawned child, wiring up streaming reader threads.
+fn start_task(mut child: Child) -> Task {
+    let (tx, rx) = channel();
+    if let Some(stdout) = child.stdout.take() {
+        spawn_reader(stdout, false, tx.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_reader(stderr, true, tx.clone());
+    }
+    // Drop the original sender so the channel disconnects once BOTH reader
+    // threads finish (EOF). If there were no readers at all, the channel is
+    // already disconnected and the task finalizes on the first poll.
+    drop(tx);
+
+    Task {
+        child: Some(child),
+        status: TaskStatus::Running,
+        output_buffer: Vec::new(),
+        error_buffer: Vec::new(),
+        rx: Some(rx),
+        exit_status: None,
+        readers_done: false,
+    }
+}
+
+/// Build a task that immediately reports a single error line and finishes.
+fn start_failed_task(msg: String) -> Task {
+    let (tx, rx) = channel();
+    let _ = tx.send(LineMsg { is_stderr: true, text: msg });
+    drop(tx);
+
+    Task {
+        child: None,
+        status: TaskStatus::Running,
+        output_buffer: Vec::new(),
+        error_buffer: Vec::new(),
+        rx: Some(rx),
+        exit_status: Some(1),
+        readers_done: false,
+    }
+}
+
+/// Non-blocking poll shared by every pipe-based backend (Cmd / Pwsh / Cygctl).
+///
+/// Drains whatever lines the reader threads have produced so far, checks whether
+/// the process has exited, and only finalizes a task once BOTH the process has
+/// exited AND all reader threads have drained (channel disconnected) — so no
+/// output is lost even if the process exits a hair before the readers finish.
+fn poll_sessions(
+    sessions: &mut HashMap<SessionId, HashMap<TaskId, Task>>,
+    session: SessionId,
+) -> Vec<SessionEvent> {
+    let mut result = Vec::new();
+    let mut completed_tasks = Vec::new();
+
+    if let Some(tasks) = sessions.get_mut(&session) {
+        for (&task_id, task) in tasks.iter_mut() {
+            // 1. Drain any lines produced since the last poll (non-blocking).
+            if let Some(rx) = &task.rx {
+                loop {
+                    match rx.try_recv() {
+                        Ok(msg) => {
+                            if msg.is_stderr {
+                                task.error_buffer.push(msg.text.clone());
+                            } else {
+                                task.output_buffer.push(msg.text.clone());
+                            }
+                            result.push(SessionEvent::Output(OutputChunk {
+                                task_id,
+                                is_stderr: msg.is_stderr,
+                                text: msg.text,
+                            }));
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            task.readers_done = true;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                task.readers_done = true;
+            }
+
+            // 2. Observe process exit (non-blocking).
+            if task.exit_status.is_none() {
+                if let Some(child) = task.child.as_mut() {
+                    if let Ok(Some(exit_status)) = child.try_wait() {
+                        task.exit_status = Some(if exit_status.success() {
+                            0
+                        } else {
+                            exit_status.code().unwrap_or(1)
+                        });
+                    }
+                }
+            }
+
+            // 3. Finalize only when the process is gone AND all output is drained.
+            if task.readers_done && task.exit_status.is_some() {
+                let status = TaskStatus::Exited(task.exit_status.unwrap());
+                task.status = status;
+                result.push(SessionEvent::TaskUpdated {
+                    task_id,
+                    status,
+                });
+                completed_tasks.push(task_id);
+            }
+        }
+
+        for task_id in completed_tasks {
+            tasks.remove(&task_id);
+        }
+    }
+
+    result
 }
 
 pub struct CmdBackend {
@@ -107,25 +254,13 @@ impl Backend for CmdBackend {
         let task_id = self.next_task;
         self.next_task += 1;
 
-
-        let mut child = Command::new("cmd")
+        let child = Command::new("cmd")
             .args(["/C", &req.command_line])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
 
-        // Take stdout and stderr to prevent buffer from filling up
-        let stdout = child.stdout.take().map(BufReader::new);
-        let stderr = child.stderr.take().map(BufReader::new);
-
-        let task = Task {
-            child: Some(child),
-            status: TaskStatus::Running,
-            output_buffer: Vec::new(),
-            error_buffer: Vec::new(),
-            stdout_reader: stdout,
-            stderr_reader: stderr,
-        };
+        let task = start_task(child);
 
         self.sessions
             .entry(session)
@@ -146,116 +281,7 @@ impl Backend for CmdBackend {
     }
 
     fn poll_events(&mut self, session: SessionId) -> Result<Vec<SessionEvent>, BackendError> {
-        let mut result = Vec::new();
-        let mut completed_tasks = Vec::new();
-
-        if let Some(tasks) = self.sessions.get_mut(&session) {
-                for (&task_id, task) in tasks.iter_mut() {
-                // Read all available output from stdout/stderr
-                // This prevents buffer deadlock and shows output immediately
-                if let Some(ref mut reader) = task.stdout_reader {
-                    use std::io::BufRead;
-                    let mut buf = Vec::new();
-                    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
-                        let line = decode_oem_line(&buf);
-                        task.output_buffer.push(line.clone());
-                        result.push(SessionEvent::Output(OutputChunk {
-                            task_id: task_id,
-                            is_stderr: false,
-                            text: line,
-                        }));
-                        buf.clear();
-                    }
-                }
-                if let Some(ref mut reader) = task.stderr_reader {
-                    use std::io::BufRead;
-                    let mut buf = Vec::new();
-                    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
-                        let line = decode_oem_line(&buf);
-                        task.error_buffer.push(line.clone());
-                        result.push(SessionEvent::Output(OutputChunk {
-                            task_id: task_id,
-                            is_stderr: true,
-                            text: line,
-                        }));
-                        buf.clear();
-                    }
-                }
-
-                if let Some(mut child) = task.child.take() {
-                    match child.try_wait() {
-                        Ok(Some(exit_status)) => {
-
-                            // Read any remaining output after process exits
-                            if let Some(mut reader) = task.stdout_reader.take() {
-                                use std::io::BufRead;
-                                let mut buf = String::new();
-                                while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-                                    let line = buf.trim_end().trim_end_matches('\r').to_string();
-                                    if !line.is_empty() {
-                                        task.output_buffer.push(line.clone());
-                                        result.push(SessionEvent::Output(OutputChunk {
-                                            task_id: task_id,
-                                            is_stderr: false,
-                                            text: line,
-                                        }));
-                                    }
-                                    buf.clear();
-                                }
-                            }
-                            if let Some(mut reader) = task.stderr_reader.take() {
-                                use std::io::BufRead;
-                                let mut buf = String::new();
-                                while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-                                    let line = buf.trim_end().trim_end_matches('\r').to_string();
-                                    if !line.is_empty() {
-                                        task.error_buffer.push(line.clone());
-                                        result.push(SessionEvent::Output(OutputChunk {
-                                            task_id: task_id,
-                                            is_stderr: true,
-                                            text: line,
-                                        }));
-                                    }
-                                    buf.clear();
-                                }
-                            }
-
-                            let status = if exit_status.success() {
-                                TaskStatus::Exited(0)
-                            } else {
-                                TaskStatus::Exited(exit_status.code().unwrap_or(1))
-                            };
-
-                            task.status = status;
-
-                            result.push(SessionEvent::TaskUpdated {
-                                task_id: task_id,
-                                status,
-                            });
-
-                            // Mark task for removal
-                            completed_tasks.push(task_id);
-                        }
-                        Ok(None) => {
-                            // Still running, put child back
-                            task.child = Some(child);
-                        }
-                        Err(_) => {
-                            task.child = Some(child);
-                        }
-                    }
-                } else if task.status == TaskStatus::Running {
-                    // Process was removed but still marked as running - should not happen
-                }
-            }
-
-            // Remove completed tasks
-            for task_id in completed_tasks {
-                tasks.remove(&task_id);
-            }
-        }
-
-        Ok(result)
+        Ok(poll_sessions(&mut self.sessions, session))
     }
 }
 
@@ -301,24 +327,13 @@ impl Backend for PwshBackend {
         let task_id = self.next_task;
         self.next_task += 1;
 
-        let mut child = Command::new("powershell")
+        let child = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &req.command_line])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
 
-        // Take stdout and stderr to prevent buffer from filling up
-        let stdout = child.stdout.take().map(BufReader::new);
-        let stderr = child.stderr.take().map(BufReader::new);
-
-        let task = Task {
-            child: Some(child),
-            status: TaskStatus::Running,
-            output_buffer: Vec::new(),
-            error_buffer: Vec::new(),
-            stdout_reader: stdout,
-            stderr_reader: stderr,
-        };
+        let task = start_task(child);
 
         self.sessions
             .entry(session)
@@ -339,106 +354,7 @@ impl Backend for PwshBackend {
     }
 
     fn poll_events(&mut self, session: SessionId) -> Result<Vec<SessionEvent>, BackendError> {
-        let mut result = Vec::new();
-        let mut completed_tasks = Vec::new();
-
-        if let Some(tasks) = self.sessions.get_mut(&session) {
-            for (&task_id, task) in tasks.iter_mut() {
-                // First, read all available output from stdout/stderr
-                if let Some(ref mut reader) = task.stdout_reader {
-                    use std::io::BufRead;
-                    let mut buf = Vec::new();
-                    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
-                        let line = decode_oem_line(&buf);
-                        task.output_buffer.push(line.clone());
-                        result.push(SessionEvent::Output(OutputChunk {
-                            task_id: task_id,
-                            is_stderr: false,
-                            text: line,
-                        }));
-                        buf.clear();
-                    }
-                }
-                if let Some(ref mut reader) = task.stderr_reader {
-                    use std::io::BufRead;
-                    let mut buf = Vec::new();
-                    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
-                        let line = decode_oem_line(&buf);
-                        task.error_buffer.push(line.clone());
-                        result.push(SessionEvent::Output(OutputChunk {
-                            task_id: task_id,
-                            is_stderr: true,
-                            text: line,
-                        }));
-                        buf.clear();
-                    }
-                }
-
-                // Then check if process has exited
-                if let Some(mut child) = task.child.take() {
-                    match child.try_wait() {
-                        Ok(Some(exit_status)) => {
-                            // Read any remaining output after process exits
-                            if let Some(mut reader) = task.stdout_reader.take() {
-                                use std::io::BufRead;
-                                let mut buf = String::new();
-                                while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-                                    let line = buf.trim_end().trim_end_matches('\r').to_string();
-                                    task.output_buffer.push(line.clone());
-                                    result.push(SessionEvent::Output(OutputChunk {
-                                        task_id: task_id,
-                                        is_stderr: false,
-                                        text: line,
-                                    }));
-                                    buf.clear();
-                                }
-                            }
-                            if let Some(mut reader) = task.stderr_reader.take() {
-                                use std::io::BufRead;
-                                let mut buf = String::new();
-                                while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-                                    let line = buf.trim_end().trim_end_matches('\r').to_string();
-                                    task.error_buffer.push(line.clone());
-                                    result.push(SessionEvent::Output(OutputChunk {
-                                        task_id: task_id,
-                                        is_stderr: true,
-                                        text: line,
-                                    }));
-                                    buf.clear();
-                                }
-                            }
-
-                            let status = if exit_status.success() {
-                                TaskStatus::Exited(0)
-                            } else {
-                                TaskStatus::Exited(exit_status.code().unwrap_or(1))
-                            };
-
-                            task.status = status;
-
-                            result.push(SessionEvent::TaskUpdated {
-                                task_id: task_id,
-                                status,
-                            });
-
-                            completed_tasks.push(task_id);
-                        }
-                        Ok(None) => {
-                            task.child = Some(child);
-                        }
-                        Err(_) => {
-                            task.child = Some(child);
-                        }
-                    }
-                }
-            }
-
-            for task_id in completed_tasks {
-                tasks.remove(&task_id);
-            }
-        }
-
-        Ok(result)
+        Ok(poll_sessions(&mut self.sessions, session))
     }
 }
 
@@ -488,35 +404,8 @@ impl Backend for CygctlBackend {
             .spawn();
 
         let task = match child {
-            Ok(mut c) => {
-                // Take stdout and stderr to prevent buffer from filling up
-                let stdout = c.stdout.take().map(BufReader::new);
-                let stderr = c.stderr.take().map(BufReader::new);
-                Task {
-                    child: Some(c),
-                    status: TaskStatus::Running,
-                    output_buffer: Vec::new(),
-                    error_buffer: Vec::new(),
-                    stdout_reader: stdout,
-                    stderr_reader: stderr,
-                }
-            }
-            Err(e) => {
-                // If cygctl is not found, create a task that will immediately fail
-                let task = Task {
-                    child: None,
-                    status: TaskStatus::Failed,
-                    output_buffer: Vec::new(),
-                    error_buffer: vec![format!("cygctl error: {}", e)],
-                    stdout_reader: None,
-                    stderr_reader: None,
-                };
-                self.sessions
-                    .entry(session)
-                    .or_insert_with(HashMap::new)
-                    .insert(task_id, task);
-                return Ok(task_id);
-            }
+            Ok(c) => start_task(c),
+            Err(e) => start_failed_task(format!("cygctl error: {}", e)),
         };
 
         self.sessions
@@ -538,109 +427,6 @@ impl Backend for CygctlBackend {
     }
 
     fn poll_events(&mut self, session: SessionId) -> Result<Vec<SessionEvent>, BackendError> {
-        let mut result = Vec::new();
-        let mut completed_tasks = Vec::new();
-
-        if let Some(tasks) = self.sessions.get_mut(&session) {
-            for (&task_id, task) in tasks.iter_mut() {
-                // First, read all available output from stdout/stderr (real-time)
-                if let Some(ref mut reader) = task.stdout_reader {
-                    use std::io::BufRead;
-                    let mut buf = Vec::new();
-                    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
-                        let line = decode_oem_line(&buf);
-                        task.output_buffer.push(line.clone());
-                        result.push(SessionEvent::Output(OutputChunk {
-                            task_id: task_id,
-                            is_stderr: false,
-                            text: line,
-                        }));
-                        buf.clear();
-                    }
-                }
-                if let Some(ref mut reader) = task.stderr_reader {
-                    use std::io::BufRead;
-                    let mut buf = Vec::new();
-                    while reader.read_until(b'\n', &mut buf).unwrap_or(0) > 0 {
-                        let line = decode_oem_line(&buf);
-                        task.error_buffer.push(line.clone());
-                        result.push(SessionEvent::Output(OutputChunk {
-                            task_id: task_id,
-                            is_stderr: true,
-                            text: line,
-                        }));
-                        buf.clear();
-                    }
-                }
-
-                // Then check if process has exited
-                if let Some(mut child) = task.child.take() {
-                    match child.try_wait() {
-                        Ok(Some(exit_status)) => {
-                            // Read any remaining output after process exits
-                            if let Some(mut reader) = task.stdout_reader.take() {
-                                use std::io::BufRead;
-                                let mut buf = String::new();
-                                while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-                                    let line = buf.trim_end().trim_end_matches('\r').to_string();
-                                    if !line.is_empty() {
-                                        task.output_buffer.push(line.clone());
-                                        result.push(SessionEvent::Output(OutputChunk {
-                                            task_id: task_id,
-                                            is_stderr: false,
-                                            text: line,
-                                        }));
-                                    }
-                                    buf.clear();
-                                }
-                            }
-                            if let Some(mut reader) = task.stderr_reader.take() {
-                                use std::io::BufRead;
-                                let mut buf = String::new();
-                                while reader.read_line(&mut buf).unwrap_or(0) > 0 {
-                                    let line = buf.trim_end().trim_end_matches('\r').to_string();
-                                    if !line.is_empty() {
-                                        task.error_buffer.push(line.clone());
-                                        result.push(SessionEvent::Output(OutputChunk {
-                                            task_id: task_id,
-                                            is_stderr: true,
-                                            text: line,
-                                        }));
-                                    }
-                                    buf.clear();
-                                }
-                            }
-
-                            let status = if exit_status.success() {
-                                TaskStatus::Exited(0)
-                            } else {
-                                TaskStatus::Exited(exit_status.code().unwrap_or(1))
-                            };
-
-                            task.status = status;
-
-                            result.push(SessionEvent::TaskUpdated {
-                                task_id: task_id,
-                                status,
-                            });
-
-                            completed_tasks.push(task_id);
-                        }
-                        Ok(None) => {
-                            task.child = Some(child);
-                        }
-                        Err(_) => {
-                            task.child = Some(child);
-                        }
-                    }
-                }
-            }
-
-            for task_id in completed_tasks {
-                tasks.remove(&task_id);
-            }
-        }
-
-        Ok(result)
+        Ok(poll_sessions(&mut self.sessions, session))
     }
 }
